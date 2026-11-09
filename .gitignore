@@ -1,0 +1,14 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.dylib
+*.dll
+.pytest_cache/
+*.gguf
+*.pt
+*.pth
+*.bin

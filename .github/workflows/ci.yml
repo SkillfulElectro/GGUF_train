@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "arena/*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.11", "3.12"]
+        exclude:
+          # macOS runners ship newer Pythons; keep matrix small but covered.
+          - os: macos-latest
+            python: "3.9"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install system build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential curl ca-certificates
+
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Build native libraries (ggml + llama.cpp bridge)
+        run: |
+          python build_native.py -j 4
+        env:
+          GGUF_TRAIN_BUILD_JOBS: "4"
+
+      - name: Install gguf-train from source (no network deps)
+        run: |
+          python -m pip install --no-build-isolation --no-deps --break-system-packages -e .
+
+      - name: Run test suite
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Build wheel and sdist for install checks
+        run: |
+          rm -rf dist build *.egg-info
+          python -m pip wheel . --no-deps --no-build-isolation -w dist
+          python setup.py sdist --dist-dir dist
+          ls -lh dist
+
+      - name: Upload install artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/
+          retention-days: 7
