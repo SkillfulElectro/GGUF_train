@@ -39,7 +39,7 @@ jobs:
 
       - name: Build native libraries (ggml + llama.cpp bridge)
         run: |
-          python build_native.py -j 4
+          python build_native.py -j 4 --refresh-llama
         env:
           GGUF_TRAIN_BUILD_JOBS: "4"
 

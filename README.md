@@ -20,13 +20,22 @@ cd GGUF_train
 python3 -m pip install .
 ```
 
-The native builder compiles vendored llama.cpp/ggml and the `csrc/` bridge into shared libraries under `gguf_train/_libs/` using `gcc`/`g++` or `clang`/`clang++` directly (no CMake or Python headers required). It can also be run explicitly:
+The native builder downloads the latest upstream llama.cpp/ggml (master) at build time and compiles it together with the `csrc/` bridge into shared libraries under `gguf_train/_libs/` using `gcc`/`g++` or `clang`/`clang++` directly (no CMake or Python headers required). It can also be run explicitly:
 
 ```sh
 python3 build_native.py
 ```
 
-First import may compile the native libraries if they are missing. Build times can be substantial. The builder currently targets CPU; accelerator support depends on the build configuration and hardware.
+Because llama.cpp is fetched from GitHub, every build uses the latest commit by default. Pin a specific revision if you need reproducible builds:
+
+```sh
+# exact commit
+GGUF_TRAIN_LLAMA_COMMIT=<sha> python3 build_native.py
+# or a branch/tag
+GGUF_TRAIN_LLAMA_BRANCH=master python3 build_native.py --refresh-llama
+```
+
+First import may compile the native libraries if they are missing; a previously downloaded copy is reused unless you request a refresh. Build times can be substantial. The builder currently targets CPU; accelerator support depends on the build configuration and hardware.
 
 ### Verify
 

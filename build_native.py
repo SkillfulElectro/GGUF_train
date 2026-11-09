@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
 Dependency-free native builder for gguf_train.
-Compiles vendored third_party/llama.cpp (ggml + llama) and csrc/ into
-shared libraries under gguf_train/_libs/ using gcc/g++ or clang/clang++ directly
-(no CMake or Python.h required), with optional CMake GPU backend support.
+Downloads the latest upstream llama.cpp (ggml + llama) into third_party/llama.cpp
+and compiles it together with csrc/ into shared libraries under gguf_train/_libs/
+using gcc/g++ or clang/clang++ directly (no CMake or Python.h required), with
+optional CMake GPU backend support.
+
+The llama.cpp source is fetched from GitHub at build time so gguf_train always
+builds against the latest commit. Pin a revision with GGUF_TRAIN_LLAMA_COMMIT or
+GGUF_TRAIN_LLAMA_BRANCH, or force a re-fetch with GGUF_TRAIN_LLAMA_REFRESH=1 /
+--refresh-llama.
 """
 
 from __future__ import annotations
@@ -15,12 +21,26 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
+import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CSRC_DIR = ROOT / "csrc"
 LLAMA_DIR = ROOT / "third_party" / "llama.cpp"
 GGML_DIR = LLAMA_DIR / "ggml"
+
+# Upstream llama.cpp source. By default the builder always fetches the latest
+# master commit so gguf_train stays current with llama.cpp. Override with env:
+#   GGUF_TRAIN_LLAMA_BRANCH   branch/tag to fetch (default: master)
+#   GGUF_TRAIN_LLAMA_COMMIT   exact commit sha to pin (reproducible builds)
+#   GGUF_TRAIN_LLAMA_REFRESH  set to "1" to re-download even if present locally
+#   GGUF_TRAIN_LLAMA_REPO     alternate upstream (mirrors/enterprise forks)
+LLAMA_REPO = os.environ.get("GGUF_TRAIN_LLAMA_REPO", "https://github.com/ggerganov/llama.cpp")
+LLAMA_BRANCH = os.environ.get("GGUF_TRAIN_LLAMA_BRANCH", "master")
+LLAMA_COMMIT = os.environ.get("GGUF_TRAIN_LLAMA_COMMIT", "")
+LLAMA_REFRESH = os.environ.get("GGUF_TRAIN_LLAMA_REFRESH", "0") == "1"
 OUT_DIR = ROOT / "gguf_train" / "_libs"
 BUILD_DIR = ROOT / "build" / "native"
 
@@ -156,6 +176,58 @@ def _supports_flag(compiler: str, flag: str) -> bool:
         return False
 
 
+def _download(url: str, dest: Path, timeout: int = 90) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url, timeout=timeout) as resp, open(dest, "wb") as out:
+        shutil.copyfileobj(resp, out)
+
+
+def ensure_llama_source(force_refresh: bool = False) -> Path:
+    """Ensure third_party/llama.cpp holds the latest upstream llama.cpp.
+
+    Downloads a GitHub source archive of the configured branch/commit when the
+    local copy is missing or GGUF_TRAIN_LLAMA_REFRESH=1. A previously vendored
+    copy is used as-is when no network refresh is requested, so offline builds
+    keep working.
+    """
+    refresh = force_refresh or LLAMA_REFRESH
+    if LLAMA_DIR.exists() and (LLAMA_DIR / "CMakeLists.txt").exists() and not refresh:
+        return LLAMA_DIR
+
+    if LLAMA_DIR.exists():
+        shutil.rmtree(LLAMA_DIR)
+    LLAMA_DIR.parent.mkdir(parents=True, exist_ok=True)
+
+    ref = LLAMA_COMMIT or LLAMA_BRANCH or "master"
+    archive_url = f"{LLAMA_REPO.rstrip('/')}/archive/{ref}.tar.gz"
+
+    last_err: Exception | None = None
+    for attempt in range(4):
+        try:
+            tmp_tar = BUILD_DIR / f"llama-{ref.replace('/', '_')}.tar.gz"
+            tmp_tar.parent.mkdir(parents=True, exist_ok=True)
+            _download(archive_url, tmp_tar)
+            extract_root = BUILD_DIR / "llama-download"
+            if extract_root.exists():
+                shutil.rmtree(extract_root)
+            extract_root.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tmp_tar) as tar:
+                tar.extractall(extract_root)
+            top = next(p for p in extract_root.iterdir() if p.is_dir())
+            shutil.move(str(top), str(LLAMA_DIR))
+            shutil.rmtree(extract_root, ignore_errors=True)
+            tmp_tar.unlink(missing_ok=True)
+            return LLAMA_DIR
+        except Exception as exc:  # noqa: BLE001 - retry then report
+            last_err = exc
+            time.sleep(min(30, 2 ** attempt))
+            continue
+
+    raise RuntimeError(
+        f"Failed to download llama.cpp from {archive_url} after 4 attempts: {last_err}"
+    )
+
+
 def _needs_rebuild(target: Path, sources: list[Path]) -> bool:
     if not target.exists():
         return True
@@ -252,6 +324,7 @@ def build_with_cmake(args) -> None:
     cmake = shutil.which("cmake")
     if not cmake:
         raise RuntimeError("cmake was requested but is not installed.")
+    ensure_llama_source()
     cm_build = ROOT / "build" / "cmake"
     cm_build.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,6 +353,8 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
     cc, cxx = _find_compilers()
     if jobs <= 0:
         jobs = max(1, int(os.environ.get("GGUF_TRAIN_BUILD_JOBS", "0")) or (os.cpu_count() or 2))
+
+    ensure_llama_source()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -466,11 +541,19 @@ def main():
     parser.add_argument("-j", "--jobs", type=int, default=0, help="Parallel compile jobs")
     parser.add_argument("--force", action="store_true", help="Force full rebuild")
     parser.add_argument("--no-llama", action="store_true", help="Skip building llama_bridge (core ggml tensor engine only)")
+    parser.add_argument(
+        "--refresh-llama",
+        action="store_true",
+        help="Force re-download of the latest llama.cpp even if a local copy exists",
+    )
     parser.add_argument("--cmake", action="store_true", help="Use CMake instead of direct compiler invocation")
     parser.add_argument("--cuda", action="store_true", help="Enable CUDA via CMake")
     parser.add_argument("--vulkan", action="store_true", help="Enable Vulkan via CMake")
     parser.add_argument("--metal", action="store_true", help="Enable Metal via CMake")
     args = parser.parse_args()
+
+    if args.refresh_llama:
+        os.environ["GGUF_TRAIN_LLAMA_REFRESH"] = "1"
 
     if args.cmake or args.cuda or args.vulkan or args.metal:
         build_with_cmake(args)
