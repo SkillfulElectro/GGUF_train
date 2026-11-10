@@ -1,0 +1,5 @@
+include LICENSE README.md build_native.py Makefile pyproject.toml setup.py
+recursive-include csrc *.h *.cpp *.txt
+recursive-include third_party/llama.cpp *
+recursive-include gguf_train *.py
+recursive-include torch *.py

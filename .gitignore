@@ -1,0 +1,18 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.dylib
+*.dll
+.pytest_cache/
+*.gguf
+*.pt
+*.pth
+*.bin
+
+# llama.cpp upstream source is downloaded at build time (always latest master).
+# Pin via GGUF_TRAIN_LLAMA_COMMIT / GGUF_TRAIN_LLAMA_BRANCH if a fixed revision is needed.
+third_party/llama.cpp/

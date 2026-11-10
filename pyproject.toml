@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gguf-train"
+version = "0.1.0"
+description = "PyTorch-compatible tensor, autograd, neural network, optimizer, and GGUF training library built natively on top of llama.cpp"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["llama.cpp", "ggml", "gguf", "pytorch", "training", "autograd", "deep-learning"]
+
+[tool.setuptools.packages.find]
+include = ["gguf_train*", "torch*"]
+
+[tool.setuptools.package-data]
+gguf_train = ["_libs/*.so", "_libs/*.dylib", "_libs/*.dll"]
