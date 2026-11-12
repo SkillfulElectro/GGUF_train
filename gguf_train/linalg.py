@@ -10,7 +10,7 @@ from . import _C, _dtype as _dt
 from ._creation import eye, zeros
 from ._functions import LinalgDetFn, LinalgInvFn, LinalgSolveFn, _wrap
 from ._ops import matmul
-from ._tensor import Tensor
+from ._tensor import Tensor, _AUTOCAST_FLOAT32, _AUTOCAST_KEEP, _AUTOCAST_LOWER, _autocast_op
 
 QRResult = namedtuple("QRResult", ["Q", "R"])
 SVDResult = namedtuple("SVDResult", ["U", "S", "Vh"])
@@ -19,6 +19,9 @@ SlogdetResult = namedtuple("SlogdetResult", ["sign", "logabsdet"])
 LstsqResult = namedtuple("LstsqResult", ["solution", "residuals", "rank", "singular_values"])
 
 
+# Decompositions and solvers are not autocast: they run in the dtype of their input, and the
+# products and sums inside them are not cast either.
+@_autocast_op(_AUTOCAST_KEEP)
 def inv(A: Tensor, *, out=None) -> Tensor:
     res = LinalgInvFn.apply(A)
     if out is not None:
@@ -27,6 +30,7 @@ def inv(A: Tensor, *, out=None) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def solve(A: Tensor, B: Tensor, *, left: bool = True, out=None) -> Tensor:
     if not left:
         # X A = B -> A^T X^T = B^T
@@ -39,6 +43,7 @@ def solve(A: Tensor, B: Tensor, *, left: bool = True, out=None) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def cholesky(A: Tensor, *, upper: bool = False, out=None) -> Tensor:
     res = _wrap(_C.lib.gt_linalg_cholesky(A._ptr, 1 if upper else 0), "linalg.cholesky")
     if out is not None:
@@ -47,6 +52,7 @@ def cholesky(A: Tensor, *, upper: bool = False, out=None) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def qr(A: Tensor, mode: str = "reduced", *, out=None):
     full = 1 if mode == "complete" else 0
     q_p, r_p = ctypes.c_void_p(), ctypes.c_void_p()
@@ -61,6 +67,7 @@ def qr(A: Tensor, mode: str = "reduced", *, out=None):
     return QRResult(q, r)
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def svd(A: Tensor, full_matrices: bool = True, *, driver=None, out=None):
     (driver,)
     u_p, s_p, vh_p = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
@@ -77,6 +84,7 @@ def svd(A: Tensor, full_matrices: bool = True, *, driver=None, out=None):
     return SVDResult(U, S, Vh)
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def svdvals(A: Tensor, *, driver=None, out=None) -> Tensor:
     _, S, _ = svd(A, full_matrices=False, driver=driver)
     if out is not None:
@@ -85,6 +93,7 @@ def svdvals(A: Tensor, *, driver=None, out=None) -> Tensor:
     return S
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def eigh(A: Tensor, UPLO: str = "L", *, out=None):
     (UPLO,)
     l_p, v_p = ctypes.c_void_p(), ctypes.c_void_p()
@@ -97,6 +106,7 @@ def eigh(A: Tensor, UPLO: str = "L", *, out=None):
     return EighResult(L, V)
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def eigvalsh(A: Tensor, UPLO: str = "L", *, out=None) -> Tensor:
     (UPLO,)
     l_p, v_p = ctypes.c_void_p(), ctypes.c_void_p()
@@ -108,6 +118,7 @@ def eigvalsh(A: Tensor, UPLO: str = "L", *, out=None) -> Tensor:
     return L
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def det(A: Tensor, *, out=None) -> Tensor:
     res = LinalgDetFn.apply(A)
     if out is not None:
@@ -116,6 +127,7 @@ def det(A: Tensor, *, out=None) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def slogdet(A: Tensor, *, out=None):
     s_p, ld_p = ctypes.c_void_p(), ctypes.c_void_p()
     _C.check_rc(_C.lib.gt_linalg_slogdet(A._ptr, ctypes.byref(s_p), ctypes.byref(ld_p)), "linalg.slogdet")
@@ -127,6 +139,7 @@ def slogdet(A: Tensor, *, out=None):
     return SlogdetResult(sign_t, logabsdet_t)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def vector_norm(x: Tensor, ord: float | int = 2, dim=None, keepdim: bool = False, *, dtype=None, out=None) -> Tensor:
     t = x if dtype is None else x.to(dtype)
     if ord == 0:
@@ -139,6 +152,7 @@ def vector_norm(x: Tensor, ord: float | int = 2, dim=None, keepdim: bool = False
     return res
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def matrix_norm(A: Tensor, ord: float | str = "fro", dim: tuple[int, int] = (-2, -1), keepdim: bool = False, *, dtype=None, out=None) -> Tensor:
     t = A if dtype is None else A.to(dtype)
     d0, d1 = dim
@@ -174,6 +188,7 @@ def matrix_norm(A: Tensor, ord: float | str = "fro", dim: tuple[int, int] = (-2,
     return res
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def norm(A: Tensor, ord=None, dim=None, keepdim: bool = False, *, dtype=None, out=None) -> Tensor:
     if dim is None and ord is None:
         return vector_norm(A, ord=2, dim=None, keepdim=keepdim, dtype=dtype, out=out)
@@ -182,6 +197,7 @@ def norm(A: Tensor, ord=None, dim=None, keepdim: bool = False, *, dtype=None, ou
     return vector_norm(A, ord=2 if ord is None else ord, dim=dim, keepdim=keepdim, dtype=dtype, out=out)
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def pinv(A: Tensor, *, rcond: float | None = None, hermitian: bool = False, out=None) -> Tensor:
     (hermitian,)
     U, S, Vh = svd(A, full_matrices=False)
@@ -198,6 +214,7 @@ def pinv(A: Tensor, *, rcond: float | None = None, hermitian: bool = False, out=
     return res
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def lstsq(A: Tensor, B: Tensor, rcond=None, *, driver=None):
     (driver,)
     X = pinv(A, rcond=rcond).matmul(B)
@@ -207,6 +224,7 @@ def lstsq(A: Tensor, B: Tensor, rcond=None, *, driver=None):
     return LstsqResult(X, resids, rank, sv)
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def matrix_rank(A: Tensor, *, tol=None, hermitian: bool = False, out=None) -> Tensor:
     (hermitian,)
     S = svdvals(A)
@@ -222,6 +240,7 @@ def matrix_rank(A: Tensor, *, tol=None, hermitian: bool = False, out=None) -> Te
     return res
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def cond(A: Tensor, p=None, *, out=None) -> Tensor:
     if p in (None, 2):
         S = svdvals(A)
@@ -266,6 +285,7 @@ def cross(input: Tensor, other: Tensor, *, dim: int = -1, out=None) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_LOWER)
 def vecdot(x: Tensor, y: Tensor, *, dim: int = -1, out=None) -> Tensor:
     res = (x * y).sum(dim=dim)
     if out is not None:
@@ -274,6 +294,7 @@ def vecdot(x: Tensor, y: Tensor, *, dim: int = -1, out=None) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_LOWER)
 def multi_dot(tensors, *, out=None) -> Tensor:
     ts = list(tensors)
     cur = ts[0]

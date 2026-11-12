@@ -1,5 +1,6 @@
 #include "gt_internal.h"
 #include <cstdarg>
+#include <limits>
 #include <sstream>
 #include <thread>
 
@@ -15,6 +16,10 @@ extern "C" const char * gt_last_error(void) {
 
 extern "C" void gt_clear_error(void) {
     g_last_error.clear();
+}
+
+extern "C" void gt_set_last_error(const char * msg) {
+    g_last_error = msg ? msg : "";
 }
 
 static void gt_ggml_log_cb(enum ggml_log_level level, const char * text, void * user_data) {
@@ -362,60 +367,89 @@ bool gt_exec_ggml_graph(
     struct ggml_tensor * out_node,
     gt_tensor * out_gt)
 {
-    (void)ctx;
     if (!be || !be->backend || !gf || !out_node || !out_gt) return false;
+    if (!out_gt->storage || !out_gt->storage->raw_tensor) return false;
 
-    std::lock_guard<std::mutex> lock(be->mtx);
-
-    bool direct_out = (out_node->view_src == nullptr) &&
-                      (out_node->data == nullptr) &&
-                      (out_gt->storage && out_gt->storage->raw_tensor) &&
-                      (out_node->type == out_gt->storage->raw_tensor->type) &&
-                      (ggml_nelements(out_node) == out_gt->numel) &&
-                      (out_gt->offset == 0);
-
-    if (direct_out) {
-        out_node->data = out_gt->storage->raw_tensor->data;
-        out_node->buffer = out_gt->storage->buf;
-    }
-
-    int n_nodes = ggml_graph_n_nodes(gf);
-    bool need_alloc = false;
-    for (int i = 0; i < n_nodes; ++i) {
-        if (ggml_graph_node(gf, i)->data == nullptr) {
-            need_alloc = true;
-            break;
-        }
-    }
-
-    if (need_alloc) {
-        if (!ggml_gallocr_reserve(be->galloc, gf)) {
-            gt_set_error("ggml_gallocr_reserve failed");
-            return false;
-        }
-        if (!ggml_gallocr_alloc_graph(be->galloc, gf)) {
-            gt_set_error("ggml_gallocr_alloc_graph failed");
-            return false;
-        }
-    }
-
-    enum ggml_status st = ggml_backend_graph_compute(be->backend, gf);
-    if (st != GGML_STATUS_SUCCESS) {
-        gt_set_error("ggml_backend_graph_compute failed");
+    // The result has to be something `out_gt` can hold, byte for byte. ggml picks the result
+    // type itself (ggml_get_rows returns F32 for F16 rows, for instance), so check before
+    // anything is computed: returning false sends the caller down its general path, whereas
+    // returning true with nothing delivered would hand out uninitialised memory.
+    const size_t out_bytes = (size_t)out_gt->numel * gt_elem_size(out_gt->dtype);
+    if (out_node->type != out_gt->storage->raw_tensor->type ||
+        ggml_nelements(out_node) != out_gt->numel ||
+        ggml_nbytes(out_node) != out_bytes) {
         return false;
     }
+    if (out_gt->numel == 0) return true;
 
-    if (!direct_out && out_gt->storage && out_gt->storage->raw_tensor && out_gt->numel > 0) {
-        if (out_node->buffer != nullptr && out_node->type == out_gt->storage->raw_tensor->type &&
-            ggml_nelements(out_node) == out_gt->numel && out_gt->offset == 0) {
-            ggml_backend_tensor_copy(out_node, out_gt->storage->raw_tensor);
-        } else if (out_node->data != nullptr && out_gt->storage->host_ptr != nullptr &&
-                   out_node->type == out_gt->storage->raw_tensor->type) {
-            memcpy(out_gt->storage->host_ptr, out_node->data, ggml_nbytes(out_node));
+    // `out_gt` owns its elements in row-major order from the start of its storage
+    const bool out_plain = gt_check_contiguous(out_gt) && out_gt->offset == 0;
+
+    std::vector<uint8_t> staged;
+    {
+        std::lock_guard<std::mutex> lock(be->mtx);
+
+        // A permuted or strided ggml view does not hold its elements in logical order, so its
+        // bytes cannot be copied anywhere as they are. Let ggml lay them out.
+        if (!ggml_is_contiguous(out_node)) {
+            if (!ctx || ggml_get_mem_size(ctx) - ggml_used_mem(ctx) < ggml_tensor_overhead() + 64) {
+                return false;
+            }
+            out_node = ggml_cont(ctx, out_node);
+            ggml_build_forward_expand(gf, out_node);
+        }
+
+        // Compute straight into the output when the node is a fresh result (not a view of
+        // another node, not an input of the graph) and the output is plain storage.
+        const bool direct_out = out_plain && out_node->view_src == nullptr && out_node->data == nullptr;
+        if (direct_out) {
+            out_node->data = out_gt->storage->raw_tensor->data;
+            out_node->buffer = out_gt->storage->buf;
+        }
+
+        int n_nodes = ggml_graph_n_nodes(gf);
+        bool need_alloc = false;
+        for (int i = 0; i < n_nodes; ++i) {
+            if (ggml_graph_node(gf, i)->data == nullptr) {
+                need_alloc = true;
+                break;
+            }
+        }
+
+        if (need_alloc) {
+            if (!ggml_gallocr_reserve(be->galloc, gf)) {
+                gt_set_error("ggml_gallocr_reserve failed");
+                return false;
+            }
+            if (!ggml_gallocr_alloc_graph(be->galloc, gf)) {
+                gt_set_error("ggml_gallocr_alloc_graph failed");
+                return false;
+            }
+        }
+
+        enum ggml_status st = ggml_backend_graph_compute(be->backend, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            gt_set_error("ggml_backend_graph_compute failed");
+            return false;
+        }
+
+        if (direct_out) return true;
+
+        // The result lives in memory the graph allocator hands to the next graph, so take it
+        // out while the backend is still locked.
+        staged.resize(out_bytes);
+        if (out_node->buffer != nullptr) {
+            ggml_backend_tensor_get(out_node, staged.data(), 0, out_bytes);
+        } else if (out_node->data != nullptr) {
+            memcpy(staged.data(), out_node->data, out_bytes);
+        } else {
+            gt_set_error("ggml graph produced no data for its output node");
+            return false;
         }
     }
 
-    return true;
+    // gt_tensor_copy_from_host honours the offset and the strides of the destination
+    return gt_tensor_copy_from_host(out_gt, staged.data(), staged.size()) == 0;
 }
 
 // ---------- Storage & Tensor Lifecycle ----------
@@ -487,6 +521,145 @@ extern "C" size_t gt_tensor_elem_size(int dtype) {
     return gt_elem_size(dtype);
 }
 
+// ---------- Storage on memory owned by the caller ----------
+
+namespace {
+struct gt_external_queue {
+    std::mutex mtx;
+    std::vector<uint64_t> tokens;
+};
+// Never destroyed: a storage may be released while the process is shutting down.
+gt_external_queue & gt_external_q() {
+    static gt_external_queue * q = new gt_external_queue();
+    return *q;
+}
+}  // namespace
+
+void gt_external_note_released(uint64_t token) {
+    gt_external_queue & q = gt_external_q();
+    std::lock_guard<std::mutex> lock(q.mtx);
+    q.tokens.push_back(token);
+}
+
+extern "C" int64_t gt_external_released(uint64_t * tokens, int64_t capacity) {
+    if (!tokens || capacity <= 0) return 0;
+    gt_external_queue & q = gt_external_q();
+    std::lock_guard<std::mutex> lock(q.mtx);
+    int64_t n = std::min<int64_t>(capacity, (int64_t)q.tokens.size());
+    for (int64_t i = 0; i < n; ++i) tokens[i] = q.tokens[(size_t)i];
+    q.tokens.erase(q.tokens.begin(), q.tokens.begin() + n);
+    return n;
+}
+
+extern "C" gt_tensor * gt_tensor_from_external(int ndim, const int64_t * shape, const int64_t * strides, int dtype, void * data, uint64_t token) {
+    gt_init();
+    if (ndim < 0 || ndim > GT_MAX_DIMS || (ndim > 0 && (!shape || !strides))) {
+        gt_set_error("from_external: invalid ndim");
+        return nullptr;
+    }
+    if (!data || token == 0) {
+        gt_set_error("from_external: a data pointer and a non-zero token are required");
+        return nullptr;
+    }
+    const size_t es = gt_elem_size(dtype);
+    if (es == 0 || gt_is_quantized(dtype)) {
+        gt_set_error("from_external: unsupported dtype");
+        return nullptr;
+    }
+    // complex values are pairs of floats: the alignment is that of one component
+    const size_t align = gt_is_complex(dtype) ? es / 2 : es;
+    if ((uintptr_t)data % align != 0) {
+        gt_set_error("from_external: the data pointer is not aligned for the element type");
+        return nullptr;
+    }
+
+    // number of elements from the first to the last one the view can reach
+    const int64_t limit = std::numeric_limits<int64_t>::max() / (int64_t)(2 * es);
+    int64_t extent = 1;
+    for (int i = 0; i < ndim; ++i) {
+        if (shape[i] <= 0) {
+            gt_set_error("from_external: every dimension must have at least one element");
+            return nullptr;
+        }
+        if (strides[i] < 0) {
+            gt_set_error("from_external: negative strides are not supported");
+            return nullptr;
+        }
+        const int64_t steps = shape[i] - 1;
+        if (steps > 0 && strides[i] > (limit - extent) / steps) {
+            gt_set_error("from_external: the array is too large");
+            return nullptr;
+        }
+        extent += steps * strides[i];
+    }
+    int64_t numel = 1;
+    for (int i = 0; i < ndim; ++i) {
+        if (shape[i] > limit / numel) {
+            gt_set_error("from_external: the array is too large");
+            return nullptr;
+        }
+        numel *= shape[i];
+    }
+
+    auto st = std::make_shared<gt_storage>();
+    st->numel = extent;
+    st->dtype = dtype;
+    st->device_type = GT_DEV_CPU;
+    st->device_index = 0;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    st->ctx = ggml_init(params);
+    if (!st->ctx) {
+        gt_set_error("ggml_init failed for tensor storage");
+        return nullptr;
+    }
+    enum ggml_type gtype = gt_dtype_to_ggml(dtype);
+    int64_t raw_elems = extent;
+    if (dtype == GT_C64)  { gtype = GGML_TYPE_F32; raw_elems *= 2; }
+    if (dtype == GT_C128) { gtype = GGML_TYPE_F64; raw_elems *= 2; }
+    if (dtype == GT_U8 || dtype == GT_BOOL) gtype = GGML_TYPE_I8;
+    st->raw_tensor = ggml_new_tensor_1d(st->ctx, gtype, raw_elems);
+    const size_t nbytes = ggml_nbytes(st->raw_tensor);
+
+    // ggml wants the buffer itself aligned, which foreign memory need not be. The buffer starts at
+    // the aligned address below `data`; the tensor inside it starts at `data`, and nothing ever
+    // touches the bytes in between (a storage buffer is never cleared as a whole).
+    const size_t buf_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    const uintptr_t addr = (uintptr_t)data;
+    const uintptr_t base = buf_align > 1 ? addr - (addr % buf_align) : addr;
+    st->buf = ggml_backend_cpu_buffer_from_ptr((void *)base, (size_t)(addr - base) + nbytes);
+    if (!st->buf) {
+        gt_set_error("from_external: could not create a buffer for the memory");
+        return nullptr;
+    }
+    if (ggml_backend_tensor_alloc(st->buf, st->raw_tensor, data) != GGML_STATUS_SUCCESS) {
+        gt_set_error("from_external: could not place the tensor in its buffer");
+        return nullptr;
+    }
+    st->nbytes = nbytes;
+    st->host_ptr = data;
+    // set last: a storage dropped on one of the error paths above must not report the token
+    st->external_token = token;
+
+    auto * t = new gt_tensor();
+    t->ndim = ndim;
+    for (int i = 0; i < ndim; ++i) {
+        t->shape[i] = shape[i];
+        t->strides[i] = strides[i];
+    }
+    t->offset = 0;
+    t->numel = numel;
+    t->dtype = dtype;
+    t->device_type = GT_DEV_CPU;
+    t->device_index = 0;
+    t->storage = st;
+    return t;
+}
+
 extern "C" gt_tensor * gt_tensor_empty(int ndim, const int64_t * shape, int dtype, int device_type, int device_index) {
     gt_init();
     if (ndim < 0 || ndim > GT_MAX_DIMS) {
@@ -554,9 +727,29 @@ extern "C" gt_tensor * gt_tensor_clone(const gt_tensor * t) {
 }
 
 extern "C" gt_tensor * gt_tensor_view(const gt_tensor * t, int ndim, const int64_t * shape, const int64_t * strides, int64_t offset) {
-    if (!t || ndim < 0 || ndim > GT_MAX_DIMS) {
+    if (!t || ndim < 0 || ndim > GT_MAX_DIMS || (ndim > 0 && (!shape || !strides))) {
         gt_set_error("Invalid view arguments");
         return nullptr;
+    }
+    // Every element of the view has to lie inside the storage. A shape with too many elements,
+    // or a wrong stride or offset, would otherwise read and write memory of something else.
+    {
+        bool empty = false;
+        int64_t lo = offset, hi = offset;
+        for (int i = 0; i < ndim; ++i) {
+            if (shape[i] < 0) {
+                gt_set_error("view: negative dimension size " + std::to_string(shape[i]));
+                return nullptr;
+            }
+            if (shape[i] == 0) empty = true;
+            const int64_t span = (shape[i] - 1) * strides[i];
+            if (span < 0) lo += span; else hi += span;
+        }
+        if (!empty && t->storage && (lo < 0 || hi >= t->storage->numel)) {
+            gt_set_error("view: elements " + std::to_string(lo) + ".." + std::to_string(hi) +
+                         " lie outside the storage of " + std::to_string(t->storage->numel) + " elements");
+            return nullptr;
+        }
     }
     auto * out = new gt_tensor();
     out->ndim = ndim;
@@ -698,6 +891,14 @@ extern "C" uint64_t gt_tensor_data_ptr(const gt_tensor * t) {
 extern "C" uint64_t gt_tensor_storage_ptr(const gt_tensor * t) {
     if (!t || !t->storage) return 0;
     return (uint64_t)(uintptr_t)t->storage.get();
+}
+extern "C" uint64_t gt_tensor_storage_host_ptr(const gt_tensor * t) {
+    if (!t || !t->storage) return 0;
+    return (uint64_t)(uintptr_t)t->storage->host_ptr;
+}
+extern "C" size_t gt_tensor_storage_nbytes(const gt_tensor * t) {
+    if (!t || !t->storage) return 0;
+    return t->storage->nbytes;
 }
 extern "C" size_t gt_tensor_nbytes(const gt_tensor * t) {
     if (!t) return 0;

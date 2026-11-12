@@ -9,7 +9,7 @@ import string
 from . import _C, _dtype as _dt
 from ._creation import arange, zeros
 from ._functions import CatFn, _wrap
-from ._tensor import Tensor, _ensure_tensor
+from ._tensor import Tensor, _AUTOCAST_FLOAT32, _AUTOCAST_LOWER, _AUTOCAST_PROMOTE, _autocast_op, _ensure_tensor, _is_int
 
 
 def _out_handle(res: Tensor, out: Tensor | None) -> Tensor:
@@ -216,6 +216,8 @@ def floor_divide(input: Tensor, other, *, out=None):
     return _out_handle(input // other, out)
 
 def pow(input: Tensor, exponent, *, out=None):
+    if not isinstance(input, Tensor) and isinstance(exponent, Tensor):
+        return _out_handle(exponent.__rpow__(input), out)  # torch.pow(2.0, t): a scalar base
     return _out_handle(input.pow(exponent), out)
 
 def maximum(input: Tensor, other: Tensor, *, out=None):
@@ -458,6 +460,45 @@ def bincount(input: Tensor, weights: Tensor | None = None, minlength: int = 0) -
 def unique(input: Tensor, sorted: bool = True, return_inverse: bool = False, return_counts: bool = False, dim: int | None = None):
     return input.unique(sorted=sorted, return_inverse=return_inverse, return_counts=return_counts, dim=dim)
 
+def broadcast_shapes(*shapes) -> tuple[int, ...]:
+    """The shape that tensors of `shapes` broadcast to (an int stands for a one-dimensional shape)."""
+    from ._device import Size
+
+    out: list[int] = []
+    for shape in shapes:
+        shape = (shape,) if _is_int(shape) else tuple(shape)
+        if len(shape) > len(out):
+            out = [1] * (len(shape) - len(out)) + out
+        for i, size in enumerate(shape, start=len(out) - len(shape)):
+            size = int(size)
+            if size < 0:
+                raise RuntimeError(f"Trying to create tensor with negative dimension ({size}): {list(shape)}")
+            if size == 1 or size == out[i]:
+                continue
+            if out[i] != 1:
+                raise RuntimeError(
+                    "Shape mismatch: objects cannot be broadcast to a single shape: "
+                    + ", ".join(str(list((sh,) if _is_int(sh) else sh)) for sh in shapes)
+                )
+            out[i] = size
+    return Size(out)
+
+
+def broadcast_tensors(*tensors):
+    """The tensors expanded to their common shape. The results are views: no element is copied."""
+    if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+        tensors = tuple(tensors[0])
+    for t in tensors:
+        if not isinstance(t, Tensor):
+            raise TypeError(f"broadcast_tensors(): expected Tensor arguments, got {type(t).__name__}")
+    shape = broadcast_shapes(*(t.shape for t in tensors))
+    return tuple(t if tuple(t.shape) == tuple(shape) else t.expand(shape) for t in tensors)
+
+
+def broadcast_to(input: Tensor, size) -> Tensor:
+    return input.expand(tuple(size))
+
+
 def meshgrid(*tensors, indexing: str | None = "ij"):
     if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
         tensors = tuple(tensors[0])
@@ -585,24 +626,30 @@ def log_softmax(input: Tensor, dim: int, dtype=None):
 
 # ---------- Matrix & Tensor Contractions ----------
 
+@_autocast_op(_AUTOCAST_LOWER)
 def matmul(input: Tensor, other: Tensor, *, out=None):
     return _out_handle(input.matmul(other), out)
 
+@_autocast_op(_AUTOCAST_LOWER)
 def mm(input: Tensor, mat2: Tensor, *, out=None):
     return _out_handle(input.mm(mat2), out)
 
+@_autocast_op(_AUTOCAST_LOWER)
 def bmm(input: Tensor, mat2: Tensor, *, out=None):
     return _out_handle(input.bmm(mat2), out)
 
+@_autocast_op(_AUTOCAST_LOWER)
 def mv(input: Tensor, vec: Tensor, *, out=None):
     return _out_handle(input.mv(vec), out)
 
 def dot(input: Tensor, tensor: Tensor, *, out=None):
     return _out_handle(input.dot(tensor), out)
 
+@_autocast_op(_AUTOCAST_LOWER)
 def addmm(input: Tensor, mat1: Tensor, mat2: Tensor, *, beta: float = 1.0, alpha: float = 1.0, out=None):
     return _out_handle(input.addmm(mat1, mat2, beta=beta, alpha=alpha), out)
 
+@_autocast_op(_AUTOCAST_LOWER)
 def baddbmm(input: Tensor, batch1: Tensor, batch2: Tensor, *, beta: float = 1.0, alpha: float = 1.0, out=None):
     return _out_handle(input.baddbmm(batch1, batch2, beta=beta, alpha=alpha), out)
 
@@ -612,8 +659,9 @@ def outer(input: Tensor, vec2: Tensor, *, out=None):
 def ger(input: Tensor, vec2: Tensor, *, out=None):
     return outer(input, vec2, out=out)
 
+@_autocast_op(_AUTOCAST_PROMOTE)
 def tensordot(a: Tensor, b: Tensor, dims=2, *, out=None) -> Tensor:
-    if isinstance(dims, int):
+    if _is_int(dims):
         dims_a = list(range(a.ndim - dims, a.ndim))
         dims_b = list(range(0, dims))
     else:
@@ -659,12 +707,14 @@ def pad(input: Tensor, pad: tuple[int, ...] | list[int], mode: str = "constant",
     from .nn.functional import pad as _f_pad
     return _f_pad(input, pad, mode=mode, value=value)
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = 1, eps: float = 1e-8) -> Tensor:
     num = (x1 * x2).sum(dim=dim)
     n1 = x1.norm(p=2, dim=dim).clamp(min=eps)
     n2 = x2.norm(p=2, dim=dim).clamp(min=eps)
     return num / (n1 * n2)
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def cdist(x1: Tensor, x2: Tensor, p: float = 2.0) -> Tensor:
     diff_t = x1.unsqueeze(-2) - x2.unsqueeze(-3)
     if p == 2.0:
@@ -675,6 +725,7 @@ def cdist(x1: Tensor, x2: Tensor, p: float = 2.0) -> Tensor:
         return diff_t.abs().amax(dim=-1)
     return (diff_t.abs() ** p).sum(dim=-1) ** (1.0 / p)
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def pdist(input: Tensor, p: float = 2.0) -> Tensor:
     n = input.shape[0]
     if n < 2:
@@ -718,6 +769,7 @@ def _reduce_single_einsum(t: Tensor, sub: str) -> tuple[Tensor, str]:
             counts[ch] = counts.get(ch, 0) + 1
     return t, sub
 
+@_autocast_op(_AUTOCAST_LOWER)
 def einsum(equation: str, *operands) -> Tensor:
     """Differentiable general einsum supporting arbitrary contractions and '...'."""
     if len(operands) == 1 and isinstance(operands[0], (list, tuple)):

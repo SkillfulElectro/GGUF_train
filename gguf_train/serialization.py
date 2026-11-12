@@ -45,6 +45,11 @@ class _SerializedTensor:
         return t
 
 
+def _restore_pickled(serialized: "_SerializedTensor") -> Tensor:
+    """What pickle calls to rebuild a Tensor (see Tensor.__reduce_ex__)."""
+    return serialized.restore()
+
+
 def _to_serializable(obj):
     from .nn.parameter import Parameter
 

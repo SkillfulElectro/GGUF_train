@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
 Dependency-free native builder for gguf_train.
-Downloads the latest upstream llama.cpp (ggml + llama) into third_party/llama.cpp
-and compiles it together with csrc/ into shared libraries under gguf_train/_libs/
-using gcc/g++ or clang/clang++ directly (no CMake or Python.h required), with
-optional CMake GPU backend support.
 
-The llama.cpp source is fetched from GitHub at build time so gguf_train always
-builds against the latest commit. Pin a revision with GGUF_TRAIN_LLAMA_COMMIT or
-GGUF_TRAIN_LLAMA_BRANCH, or force a re-fetch with GGUF_TRAIN_LLAMA_REFRESH=1 /
---refresh-llama.
+Fetches a *pinned* llama.cpp revision (ggml + llama) into third_party/llama.cpp
+and compiles it together with csrc/ into shared libraries under
+gguf_train/_libs/ using gcc/g++ or clang/clang++ directly (no CMake or Python.h
+required), with optional CMake GPU backend support.
+
+The revision is pinned (LLAMA_PINNED_COMMIT) so that every build of a given
+gguf_train checkout compiles exactly the llama.cpp sources it was developed and
+tested against. Override it with:
+
+  GGUF_TRAIN_LLAMA_COMMIT   exact commit sha (or tag) to build against
+  GGUF_TRAIN_LLAMA_BRANCH   branch/tag to track instead (e.g. "master")
+  GGUF_TRAIN_LLAMA_REPO     alternate upstream (mirrors/enterprise forks)
+  GGUF_TRAIN_LLAMA_REFRESH  set to "1" (or pass --refresh-llama) to re-download
+
+The list of llama.cpp/ggml translation units is discovered from the fetched tree
+rather than hardcoded, so upstream adding, renaming or splitting source files
+does not break the build.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -30,86 +41,58 @@ ROOT = Path(__file__).resolve().parent
 CSRC_DIR = ROOT / "csrc"
 LLAMA_DIR = ROOT / "third_party" / "llama.cpp"
 GGML_DIR = LLAMA_DIR / "ggml"
-
-# Upstream llama.cpp source. By default the builder always fetches the latest
-# master commit so gguf_train stays current with llama.cpp. Override with env:
-#   GGUF_TRAIN_LLAMA_BRANCH   branch/tag to fetch (default: master)
-#   GGUF_TRAIN_LLAMA_COMMIT   exact commit sha to pin (reproducible builds)
-#   GGUF_TRAIN_LLAMA_REFRESH  set to "1" to re-download even if present locally
-#   GGUF_TRAIN_LLAMA_REPO     alternate upstream (mirrors/enterprise forks)
-LLAMA_REPO = os.environ.get("GGUF_TRAIN_LLAMA_REPO", "https://github.com/ggerganov/llama.cpp")
-LLAMA_BRANCH = os.environ.get("GGUF_TRAIN_LLAMA_BRANCH", "master")
-LLAMA_COMMIT = os.environ.get("GGUF_TRAIN_LLAMA_COMMIT", "")
-LLAMA_REFRESH = os.environ.get("GGUF_TRAIN_LLAMA_REFRESH", "0") == "1"
 OUT_DIR = ROOT / "gguf_train" / "_libs"
 BUILD_DIR = ROOT / "build" / "native"
 
-GGML_BASE_SOURCES = [
-    "ggml/src/ggml.c",
-    "ggml/src/ggml.cpp",
-    "ggml/src/ggml-alloc.c",
-    "ggml/src/ggml-backend.cpp",
-    "ggml/src/ggml-backend-meta.cpp",
-    "ggml/src/ggml-opt.cpp",
-    "ggml/src/ggml-threading.cpp",
-    "ggml/src/ggml-quants.c",
-    "ggml/src/gguf.cpp",
-    "ggml/src/ggml-backend-dl.cpp",
-    "ggml/src/ggml-backend-reg.cpp",
-]
+# llama.cpp revision gguf_train is built and tested against (release tag b12283).
+# A full commit sha is used rather than the tag name because a sha is immutable.
+# Bump both together after re-running the test suite against the new revision.
+LLAMA_PINNED_COMMIT = "f3b407ca1bfeeecebf9e9ef19fcd6eed565bd70a"
+LLAMA_PINNED_TAG = "b12283"
+LLAMA_DEFAULT_REPO = "https://github.com/ggml-org/llama.cpp"
 
-GGML_CPU_SOURCES = [
-    "ggml/src/ggml-cpu/ggml-cpu.c",
-    "ggml/src/ggml-cpu/ggml-cpu.cpp",
-    "ggml/src/ggml-cpu/repack.cpp",
-    "ggml/src/ggml-cpu/hbm.cpp",
-    "ggml/src/ggml-cpu/quants.c",
-    "ggml/src/ggml-cpu/traits.cpp",
-    "ggml/src/ggml-cpu/amx/amx.cpp",
-    "ggml/src/ggml-cpu/amx/mmq.cpp",
-    "ggml/src/ggml-cpu/tiled/tiled.cpp",
-    "ggml/src/ggml-cpu/tiled/tiled-kernel.cpp",
-    "ggml/src/ggml-cpu/binary-ops.cpp",
-    "ggml/src/ggml-cpu/unary-ops.cpp",
-    "ggml/src/ggml-cpu/vec.cpp",
-    "ggml/src/ggml-cpu/ops.cpp",
-]
+# Written into the fetched tree; records which revision it holds.
+SOURCE_STAMP_NAME = "gguf_train_source.json"
+# Written next to the object files; records which revision they were compiled from.
+BUILD_STAMP = BUILD_DIR / "llama_source.json"
 
-LLAMA_CORE_SOURCES = [
-    "src/llama.cpp",
-    "src/llama-adapter.cpp",
-    "src/llama-arch.cpp",
-    "src/llama-batch.cpp",
-    "src/llama-chat.cpp",
-    "src/llama-context.cpp",
-    "src/llama-cparams.cpp",
-    "src/llama-grammar.cpp",
-    "src/llama-graph.cpp",
-    "src/llama-hparams.cpp",
-    "src/llama-impl.cpp",
-    "src/llama-io.cpp",
-    "src/llama-kv-cache.cpp",
-    "src/llama-kv-cache-iswa.cpp",
-    "src/llama-kv-cache-dsa.cpp",
-    "src/llama-kv-cache-dsa-iswa.cpp",
-    "src/llama-kv-cache-msa.cpp",
-    "src/llama-kv-cache-dsv4.cpp",
-    "src/llama-memory.cpp",
-    "src/llama-moe-cache.cpp",
-    "src/llama-memory-hybrid.cpp",
-    "src/llama-memory-hybrid-iswa.cpp",
-    "src/llama-memory-hybrid-idx.cpp",
-    "src/llama-memory-recurrent.cpp",
-    "src/llama-mmap.cpp",
-    "src/llama-model-loader.cpp",
-    "src/llama-model-saver.cpp",
-    "src/llama-model.cpp",
-    "src/llama-quant.cpp",
-    "src/llama-sampler.cpp",
-    "src/llama-vocab.cpp",
-    "src/unicode-data.cpp",
-    "src/unicode.cpp",
-]
+# ggml-cpu sub-directories that upstream compiles unconditionally. Every other
+# sub-directory (llamafile, kleidiai, spacemit, ...) is an opt-in feature that
+# needs extra flags/dependencies, and arch/<name> is selected per target CPU.
+GGML_CPU_SUBDIRS = ("amx", "tiled")
+
+# platform.machine() -> ggml-cpu/arch/<name>
+_ARCH_DIRS = (
+    (("x86_64", "amd64", "i686", "i386", "x86"), "x86"),
+    (("arm64", "aarch64", "armv7l", "armv8l"), "arm"),
+    (("ppc64", "ppc64le", "powerpc64", "powerpc64le"), "powerpc"),
+    (("riscv64", "riscv32"), "riscv"),
+    (("s390x", "s390"), "s390"),
+    (("loongarch64",), "loongarch"),
+)
+# Only these per-arch files belong to the statically linked CPU backend;
+# cpu-feats.cpp is exclusively for upstream's dlopen()ed backend variants.
+_ARCH_FILES = ("quants.c", "repack.cpp")
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def llama_repo() -> str:
+    repo = _env("GGUF_TRAIN_LLAMA_REPO", LLAMA_DEFAULT_REPO).rstrip("/")
+    return repo[:-4] if repo.endswith(".git") else repo
+
+
+def llama_ref() -> str:
+    """Revision to build against: explicit commit > explicit branch/tag > pinned default."""
+    return _env("GGUF_TRAIN_LLAMA_COMMIT") or _env("GGUF_TRAIN_LLAMA_BRANCH") or LLAMA_PINNED_COMMIT
+
+
+def _log(msg: str) -> None:
+    sys.stderr.write(f"[gguf_train] {msg}\n")
+    sys.stderr.flush()
+
 
 GT_SOURCES = [
     "csrc/gt_core.cpp",
@@ -182,50 +165,146 @@ def _download(url: str, dest: Path, timeout: int = 90) -> None:
         shutil.copyfileobj(resp, out)
 
 
-def ensure_llama_source(force_refresh: bool = False) -> Path:
-    """Ensure third_party/llama.cpp holds the latest upstream llama.cpp.
+def _read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
-    Downloads a GitHub source archive of the configured branch/commit when the
-    local copy is missing or GGUF_TRAIN_LLAMA_REFRESH=1. A previously vendored
-    copy is used as-is when no network refresh is requested, so offline builds
-    keep working.
+
+def read_source_stamp(llama_dir: Path | None = None) -> dict | None:
+    """Revision record of a tree fetched by this builder; None for a tree it does not manage."""
+    return _read_json((llama_dir or LLAMA_DIR) / SOURCE_STAMP_NAME)
+
+
+def _has_llama_tree(llama_dir: Path | None = None) -> bool:
+    d = llama_dir or LLAMA_DIR
+    return (d / "CMakeLists.txt").is_file() and (d / "ggml" / "src" / "ggml.c").is_file()
+
+
+def _is_hex(s: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F]+", s))
+
+
+def _stamp_matches(stamp: dict, repo: str, ref: str) -> bool:
+    if stamp.get("repo") != repo:
+        return False
+    commit = str(stamp.get("commit") or "")
+    if ref == stamp.get("ref") or (commit and ref == commit):
+        return True
+    # An abbreviated sha naming the commit the tree already holds.
+    return len(ref) >= 7 and _is_hex(ref) and commit.lower().startswith(ref.lower())
+
+
+def _extract_archive(tar: tarfile.TarFile, dest: Path) -> None:
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(dest, filter="data")
+        return
+    # Interpreters without extraction filters: refuse anything that would land
+    # outside dest and drop links/special files (the build needs neither).
+    root = dest.resolve()
+    members = []
+    for m in tar.getmembers():
+        target = (root / m.name).resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"refusing to extract {m.name!r}: path escapes the archive root")
+        if m.isfile() or m.isdir():
+            members.append(m)
+    tar.extractall(dest, members=members)
+
+
+def _fetch_llama_archive(repo: str, ref: str) -> tuple[Path, str]:
+    """Download and unpack <repo>@<ref>. Returns (unpacked tree, commit sha or "")."""
+    archive_url = f"{repo}/archive/{ref}.tar.gz"
+    tmp_tar = BUILD_DIR / ("llama-" + re.sub(r"[^A-Za-z0-9._-]", "_", ref) + ".tar.gz")
+    extract_root = BUILD_DIR / "llama-download"
+    attempts = 4
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            _download(archive_url, tmp_tar)
+            if extract_root.exists():
+                shutil.rmtree(extract_root)
+            extract_root.mkdir(parents=True)
+            with tarfile.open(tmp_tar) as tar:
+                # GitHub records the archived commit in the pax global header.
+                commit = str(tar.pax_headers.get("comment", "")).strip()
+                _extract_archive(tar, extract_root)
+            tops = [d for d in extract_root.iterdir() if d.is_dir()]
+            if len(tops) != 1 or not _has_llama_tree(tops[0]):
+                raise RuntimeError("archive does not look like a llama.cpp source tree")
+            return tops[0], (commit if _is_hex(commit) else "")
+        except Exception as exc:  # noqa: BLE001 - retry then report
+            last_err = exc
+            code = getattr(exc, "code", None)
+            if isinstance(code, int) and 400 <= code < 500 and code != 429:
+                break  # e.g. 404 for an unknown revision: retrying cannot help
+            if attempt + 1 < attempts:
+                time.sleep(min(30, 2 ** attempt))
+        finally:
+            if tmp_tar.exists():
+                tmp_tar.unlink()
+    shutil.rmtree(extract_root, ignore_errors=True)
+    raise RuntimeError(f"Failed to download llama.cpp revision {ref!r} from {archive_url}: {last_err}")
+
+
+def ensure_llama_source(force_refresh: bool = False) -> Path:
+    """Ensure third_party/llama.cpp holds the requested llama.cpp revision.
+
+    The requested revision is GGUF_TRAIN_LLAMA_COMMIT, else GGUF_TRAIN_LLAMA_BRANCH,
+    else the pinned LLAMA_PINNED_COMMIT. A tree fetched by this builder carries a
+    stamp naming its revision and is re-fetched when a different one is requested.
+    A tree without a stamp (placed there by hand, or by an older gguf_train) is
+    used as-is unless a revision is requested explicitly or a refresh is forced,
+    so vendored/offline builds keep working.
     """
-    refresh = force_refresh or LLAMA_REFRESH
-    if LLAMA_DIR.exists() and (LLAMA_DIR / "CMakeLists.txt").exists() and not refresh:
-        return LLAMA_DIR
+    repo, ref = llama_repo(), llama_ref()
+    explicit = bool(_env("GGUF_TRAIN_LLAMA_COMMIT") or _env("GGUF_TRAIN_LLAMA_BRANCH"))
+    refresh = force_refresh or _env("GGUF_TRAIN_LLAMA_REFRESH", "0") == "1"
+    try:
+        where = LLAMA_DIR.relative_to(ROOT).as_posix()
+    except ValueError:
+        where = str(LLAMA_DIR)
+
+    if _has_llama_tree() and not refresh:
+        stamp = read_source_stamp()
+        if stamp is None:
+            if not explicit:
+                _log(
+                    f"using the existing {where} as-is; its revision is unknown, so this build is not "
+                    f"pinned. Pass --refresh-llama to replace it with llama.cpp {LLAMA_PINNED_TAG}."
+                )
+                return LLAMA_DIR
+            _log(f"{where} is of unknown revision but {ref} was requested; fetching it")
+        elif _stamp_matches(stamp, repo, ref):
+            return LLAMA_DIR
+        else:
+            _log(f"{where} holds {stamp.get('commit') or stamp.get('ref')} but {ref} is requested; fetching it")
+
+    if (LLAMA_DIR / ".git").exists():
+        raise RuntimeError(
+            f"{LLAMA_DIR} is a git checkout, so it will not be overwritten. Check out the "
+            f"revision you want there with git, or remove the directory to let the builder fetch {ref}."
+        )
+
+    label = f"{LLAMA_PINNED_TAG} ({ref[:12]})" if ref == LLAMA_PINNED_COMMIT else ref
+    _log(f"fetching llama.cpp {label} from {repo}")
+    # Download and unpack first so a failed fetch leaves any existing tree intact.
+    top, commit = _fetch_llama_archive(repo, ref)
+    if len(ref) == 40 and _is_hex(ref) and commit and commit.lower() != ref.lower():
+        shutil.rmtree(top.parent, ignore_errors=True)
+        raise RuntimeError(f"Requested llama.cpp commit {ref} but the archive contains {commit}")
 
     if LLAMA_DIR.exists():
         shutil.rmtree(LLAMA_DIR)
     LLAMA_DIR.parent.mkdir(parents=True, exist_ok=True)
-
-    ref = LLAMA_COMMIT or LLAMA_BRANCH or "master"
-    archive_url = f"{LLAMA_REPO.rstrip('/')}/archive/{ref}.tar.gz"
-
-    last_err: Exception | None = None
-    for attempt in range(4):
-        try:
-            tmp_tar = BUILD_DIR / f"llama-{ref.replace('/', '_')}.tar.gz"
-            tmp_tar.parent.mkdir(parents=True, exist_ok=True)
-            _download(archive_url, tmp_tar)
-            extract_root = BUILD_DIR / "llama-download"
-            if extract_root.exists():
-                shutil.rmtree(extract_root)
-            extract_root.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(tmp_tar) as tar:
-                tar.extractall(extract_root)
-            top = next(p for p in extract_root.iterdir() if p.is_dir())
-            shutil.move(str(top), str(LLAMA_DIR))
-            shutil.rmtree(extract_root, ignore_errors=True)
-            tmp_tar.unlink(missing_ok=True)
-            return LLAMA_DIR
-        except Exception as exc:  # noqa: BLE001 - retry then report
-            last_err = exc
-            time.sleep(min(30, 2 ** attempt))
-            continue
-
-    raise RuntimeError(
-        f"Failed to download llama.cpp from {archive_url} after 4 attempts: {last_err}"
+    shutil.move(str(top), str(LLAMA_DIR))
+    shutil.rmtree(top.parent, ignore_errors=True)
+    (LLAMA_DIR / SOURCE_STAMP_NAME).write_text(
+        json.dumps({"repo": repo, "ref": ref, "commit": commit}, indent=2, sort_keys=True) + "\n"
     )
+    return LLAMA_DIR
 
 
 def _needs_rebuild(target: Path, sources: list[Path]) -> bool:
@@ -238,76 +317,163 @@ def _needs_rebuild(target: Path, sources: list[Path]) -> bool:
     return False
 
 
-def _ensure_generated_headers(gen_inc: Path):
+def _cmake_version(cmake_file: Path, prefix: str) -> str | None:
+    """Read set(<prefix>_VERSION_{MAJOR,MINOR,PATCH} n) from an upstream CMakeLists.txt."""
+    try:
+        text = cmake_file.read_text(errors="replace")
+    except OSError:
+        return None
+    parts = []
+    for comp in ("MAJOR", "MINOR", "PATCH"):
+        m = re.search(rf"set\s*\(\s*{prefix}_VERSION_{comp}\s+(\d+)\s*\)", text)
+        if not m:
+            return None
+        parts.append(m.group(1))
+    return ".".join(parts)
+
+
+def _write_if_changed(path: Path, content: str) -> None:
+    if not path.exists() or path.read_text() != content:
+        path.write_text(content)
+
+
+def _ensure_generated_headers(gen_inc: Path, llama_dir: Path | None = None) -> None:
+    """Generate ggml-version.h / llama-version.h describing the tree actually being built.
+
+    Upstream produces these with CMake's configure_file(); mirror that by filling
+    in its own templates with the versions declared in its CMakeLists.txt.
+    """
+    llama_dir = llama_dir or LLAMA_DIR
     gen_inc.mkdir(parents=True, exist_ok=True)
-    ggml_ver = gen_inc / "ggml-version.h"
-    if not ggml_ver.exists():
-        ggml_ver.write_text(
-            '#pragma once\n#define GGML_VERSION "0.29.0"\n#define GGML_COMMIT "vendored"\n'
-        )
-    llama_ver = gen_inc / "llama-version.h"
-    if not llama_ver.exists():
-        llama_ver.write_text(
-            '#pragma once\n#define LLAMA_VERSION "0.29.0"\n#define LLAMA_COMMIT "vendored"\n'
-        )
+    stamp = read_source_stamp(llama_dir) or {}
+    commit = str(stamp.get("commit") or stamp.get("ref") or "unknown")
+    values = {
+        "GGML_VERSION": _cmake_version(llama_dir / "ggml" / "CMakeLists.txt", "GGML") or "unknown",
+        "GGML_BUILD_COMMIT": commit,
+        "LLAMA_VERSION": _cmake_version(llama_dir / "CMakeLists.txt", "LLAMA") or "unknown",
+        "LLAMA_BUILD_COMMIT": commit,
+    }
+    headers = (
+        ("ggml-version.h", llama_dir / "ggml" / "src" / "ggml-version.h.in", ("GGML_VERSION", "GGML_COMMIT")),
+        ("llama-version.h", llama_dir / "src" / "llama-version.h.in", ("LLAMA_VERSION", "LLAMA_COMMIT")),
+    )
+    for name, template, (ver_macro, commit_macro) in headers:
+        if template.is_file():
+            content = re.sub(r"@(\w+)@", lambda m: values.get(m.group(1), "unknown"), template.read_text())
+        else:
+            content = (
+                "#pragma once\n"
+                f'#define {ver_macro} "{values[ver_macro]}"\n'
+                f'#define {commit_macro} "{commit}"\n'
+            )
+        _write_if_changed(gen_inc / name, content)
 
 
-def _arch_sources() -> list[str]:
-    mach = platform.machine().lower()
-    if mach in ("x86_64", "amd64", "i686", "x86"):
-        return [
-            "ggml/src/ggml-cpu/arch/x86/quants.c",
-            "ggml/src/ggml-cpu/arch/x86/repack.cpp",
-        ]
-    if mach in ("arm64", "aarch64"):
-        return [
-            "ggml/src/ggml-cpu/arch/arm/quants.c",
-            "ggml/src/ggml-cpu/arch/arm/repack.cpp",
-        ]
-    if "ppc64" in mach:
-        return [
-            "ggml/src/ggml-cpu/arch/powerpc/quants.c",
-            "ggml/src/ggml-cpu/arch/powerpc/repack.cpp",
-        ]
-    if "riscv" in mach:
-        return [
-            "ggml/src/ggml-cpu/arch/riscv/quants.c",
-            "ggml/src/ggml-cpu/arch/riscv/repack.cpp",
-        ]
-    if "s390" in mach:
-        return ["ggml/src/ggml-cpu/arch/s390/quants.c"]
-    if "loongarch" in mach:
-        return [
-            "ggml/src/ggml-cpu/arch/loongarch/quants.c",
-            "ggml/src/ggml-cpu/arch/loongarch/repack.cpp",
-        ]
-    return []
+def _glob_sources(directory: Path, base: Path) -> list[str]:
+    if not directory.is_dir():
+        return []
+    found = [f for pattern in ("*.c", "*.cpp") for f in directory.glob(pattern) if f.is_file()]
+    return sorted(f.relative_to(base).as_posix() for f in found)
+
+
+def _arch_dir(machine: str | None = None) -> str | None:
+    mach = (machine or platform.machine()).lower()
+    for names, arch in _ARCH_DIRS:
+        if mach in names:
+            return arch
+    return None
+
+
+def collect_ggml_sources(llama_dir: Path | None = None, machine: str | None = None) -> list[str]:
+    """ggml core + CPU backend translation units present in the tree, relative to llama_dir."""
+    llama_dir = llama_dir or LLAMA_DIR
+    ggml_src = llama_dir / "ggml" / "src"
+    cpu = ggml_src / "ggml-cpu"
+    sources = _glob_sources(ggml_src, llama_dir)
+    sources += _glob_sources(cpu, llama_dir)
+    for sub in GGML_CPU_SUBDIRS:
+        sources += _glob_sources(cpu / sub, llama_dir)
+    arch = _arch_dir(machine)
+    if arch:
+        arch_dir = cpu / "arch" / arch
+        sources += [(arch_dir / n).relative_to(llama_dir).as_posix() for n in _ARCH_FILES if (arch_dir / n).is_file()]
+    return sources
+
+
+def collect_llama_sources(llama_dir: Path | None = None) -> tuple[list[str], list[str]]:
+    """(core, per-architecture model) translation units of libllama, relative to llama_dir."""
+    llama_dir = llama_dir or LLAMA_DIR
+    core = _glob_sources(llama_dir / "src", llama_dir)
+    models = _glob_sources(llama_dir / "src" / "models", llama_dir)
+    return core, models
+
+
+def _sync_build_stamp() -> bool:
+    """Discard build products of another llama.cpp revision. Returns True if any were discarded.
+
+    Freshness is otherwise judged by mtime, and files unpacked from an archive
+    keep their commit timestamps, so a tree swapped for another revision can
+    look *older* than the objects and libraries built from the previous one.
+    The stamp is rewritten before compiling, which lets an interrupted build of
+    the new revision resume instead of starting over.
+    """
+    current = read_source_stamp()
+    built_from = _read_json(BUILD_STAMP) if BUILD_STAMP.exists() else None
+    if current == built_from:
+        # Same revision, or an unmanaged tree built before (mtimes are all there is to go on).
+        return False
+    for d in (BUILD_DIR / "obj", BUILD_DIR / "gen_src", BUILD_DIR / "include"):
+        shutil.rmtree(d, ignore_errors=True)
+    discarded = False
+    for stem in ("ggml_train_ggml", "gguf_train", "llama_train_llama", "llama_bridge"):
+        lib = OUT_DIR / lib_filename(stem)
+        if lib.exists():
+            lib.unlink()
+            discarded = True
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    if current is None:
+        BUILD_STAMP.unlink()
+    else:
+        BUILD_STAMP.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+    return discarded
 
 
 def _compile_unit(cmd: list[str], src: Path, obj: Path, force: bool) -> Path:
+    """Compile src to obj with `cmd` (compiler + flags, without the -c/-o arguments)."""
     obj.parent.mkdir(parents=True, exist_ok=True)
     if not force and not _needs_rebuild(obj, [src]):
         return obj
+    # Compile under a temporary name and rename on success: an interrupted compiler must
+    # not leave a truncated object behind that the next (resumed) build takes for current.
+    tmp = obj.with_name(obj.name + ".part")
+    cmd = cmd + ["-c", str(src), "-o", str(tmp)]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
+        if tmp.exists():
+            tmp.unlink()
         raise RuntimeError(
             f"Compilation failed for {src}:\nCMD: {' '.join(cmd)}\nSTDERR:\n{res.stderr}\nSTDOUT:\n{res.stdout}"
         )
+    os.replace(tmp, obj)
     return obj
 
 
 def _generate_llama_model_unity_chunks(gen_src: Path, batch_size: int = 16) -> list[Path]:
-    models_dir = LLAMA_DIR / "src" / "models"
-    model_files = sorted(models_dir.glob("*.cpp"))
+    """Group src/models/*.cpp into unity translation units (upstream uses the same batch size)."""
+    _, models = collect_llama_sources()
+    model_files = [LLAMA_DIR / m for m in models]
     gen_src.mkdir(parents=True, exist_ok=True)
     chunks: list[Path] = []
     for idx in range(0, len(model_files), batch_size):
         group = model_files[idx : idx + batch_size]
         chunk_file = gen_src / f"llama_models_unity_{idx // batch_size:02d}.cpp"
-        content = "".join(f'#include "{p.resolve()}"\n' for p in group)
-        if not chunk_file.exists() or chunk_file.read_text() != content:
-            chunk_file.write_text(content)
+        content = "".join(f'#include "{p.resolve().as_posix()}"\n' for p in group)
+        _write_if_changed(chunk_file, content)
         chunks.append(chunk_file)
+    # A previous build may have left more chunks behind than this tree needs.
+    for leftover in gen_src.glob("llama_models_unity_*.cpp"):
+        if leftover not in chunks:
+            leftover.unlink()
     return chunks
 
 
@@ -324,7 +490,7 @@ def build_with_cmake(args) -> None:
     cmake = shutil.which("cmake")
     if not cmake:
         raise RuntimeError("cmake was requested but is not installed.")
-    ensure_llama_source()
+    ensure_llama_source(force_refresh=bool(getattr(args, "refresh_llama", False)))
     cm_build = ROOT / "build" / "cmake"
     cm_build.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -349,15 +515,22 @@ def build_with_cmake(args) -> None:
                 shutil.copy2(p, dst)
 
 
-def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -> dict[str, Path]:
+def build_direct(
+    jobs: int = 0,
+    build_llama: bool = True,
+    force: bool = False,
+    refresh_llama: bool = False,
+) -> dict[str, Path]:
     cc, cxx = _find_compilers()
     if jobs <= 0:
         jobs = max(1, int(os.environ.get("GGUF_TRAIN_BUILD_JOBS", "0")) or (os.cpu_count() or 2))
 
-    ensure_llama_source()
+    ensure_llama_source(force_refresh=refresh_llama)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    if _sync_build_stamp():
+        _log("llama.cpp revision changed since the last build; rebuilding the native libraries")
     gen_inc = BUILD_DIR / "include"
     gen_src = BUILD_DIR / "gen_src"
     obj_dir = BUILD_DIR / "obj"
@@ -412,8 +585,10 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
         f"-I{GGML_DIR / 'src' / 'ggml-cpu'}",
     ]
 
-    ggml_rel_sources = GGML_BASE_SOURCES + GGML_CPU_SOURCES + _arch_sources()
-    tasks = []
+    ggml_rel_sources = collect_ggml_sources()
+    llama_core_sources, _ = collect_llama_sources()
+    if not ggml_rel_sources or (build_llama and not llama_core_sources):
+        raise RuntimeError(f"No llama.cpp/ggml sources found under {LLAMA_DIR}; the source tree looks incomplete.")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         # 1. Compile ggml objects
@@ -427,7 +602,7 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
                 is_c = src.suffix == ".c"
                 comp = cc if is_c else cxx
                 std = "-std=c11" if is_c else "-std=c++17"
-                cmd = [comp, std] + ggml_defs + ["-c", str(src), "-o", str(obj)]
+                cmd = [comp, std] + ggml_defs
                 ggml_futures.append(pool.submit(_compile_unit, cmd, src, obj, force))
             for f in ggml_futures:
                 f.result()
@@ -451,7 +626,7 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
         for s in gt_srcs:
             obj = obj_dir / "csrc" / (s.name + ".o")
             gt_objs.append(obj)
-            cmd = [cxx] + gt_defs + ["-c", str(s), "-o", str(obj)]
+            cmd = [cxx] + gt_defs
             gt_futures.append(pool.submit(_compile_unit, cmd, s, obj, force or _needs_rebuild(obj, csrc_headers + [s])))
         for f in gt_futures:
             f.result()
@@ -483,7 +658,7 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
                 f"-I{GGML_DIR / 'include'}",
             ]
             unity_chunks = _generate_llama_model_unity_chunks(gen_src, batch_size=16)
-            llama_srcs = [LLAMA_DIR / s for s in LLAMA_CORE_SOURCES] + unity_chunks
+            llama_srcs = [LLAMA_DIR / s for s in llama_core_sources] + unity_chunks
             if force or not llama_out.exists() or _needs_rebuild(llama_out, llama_srcs):
                 llama_objs: list[Path] = []
                 llama_futures = []
@@ -491,7 +666,7 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
                     rel_name = s.name if s.parent == gen_src else f"src_{s.name}"
                     obj = obj_dir / "llama" / (rel_name + ".o")
                     llama_objs.append(obj)
-                    cmd = [cxx] + llama_defs + ["-c", str(s), "-o", str(obj)]
+                    cmd = [cxx] + llama_defs
                     llama_futures.append(pool.submit(_compile_unit, cmd, s, obj, force))
                 for f in llama_futures:
                     f.result()
@@ -517,7 +692,7 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
                 f"-I{LLAMA_DIR / 'include'}",
                 f"-I{GGML_DIR / 'include'}",
             ]
-            b_cmd = [cxx] + bridge_defs + ["-c", str(bridge_src), "-o", str(bridge_obj)]
+            b_cmd = [cxx] + bridge_defs
             _compile_unit(b_cmd, bridge_src, bridge_obj, force or _needs_rebuild(bridge_obj, [bridge_src] + csrc_headers))
             b_link_cmd = (
                 [cxx, "-shared"]
@@ -537,14 +712,14 @@ def build_direct(jobs: int = 0, build_llama: bool = True, force: bool = False) -
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build gguf_train native libraries on top of vendored llama.cpp")
+    parser = argparse.ArgumentParser(description="Build gguf_train native libraries on top of a pinned llama.cpp")
     parser.add_argument("-j", "--jobs", type=int, default=0, help="Parallel compile jobs")
     parser.add_argument("--force", action="store_true", help="Force full rebuild")
     parser.add_argument("--no-llama", action="store_true", help="Skip building llama_bridge (core ggml tensor engine only)")
     parser.add_argument(
         "--refresh-llama",
         action="store_true",
-        help="Force re-download of the latest llama.cpp even if a local copy exists",
+        help="Re-download the configured llama.cpp revision even if a local copy exists",
     )
     parser.add_argument("--cmake", action="store_true", help="Use CMake instead of direct compiler invocation")
     parser.add_argument("--cuda", action="store_true", help="Enable CUDA via CMake")
@@ -552,14 +727,19 @@ def main():
     parser.add_argument("--metal", action="store_true", help="Enable Metal via CMake")
     args = parser.parse_args()
 
-    if args.refresh_llama:
-        os.environ["GGUF_TRAIN_LLAMA_REFRESH"] = "1"
-
     if args.cmake or args.cuda or args.vulkan or args.metal:
         build_with_cmake(args)
         print(f"Built native libraries with CMake in {OUT_DIR}")
     else:
-        libs = build_direct(jobs=args.jobs, build_llama=not args.no_llama, force=args.force)
+        libs = build_direct(
+            jobs=args.jobs,
+            build_llama=not args.no_llama,
+            force=args.force,
+            refresh_llama=args.refresh_llama,
+        )
+        stamp = read_source_stamp()
+        if stamp:
+            print(f"llama.cpp revision: {stamp.get('commit') or stamp.get('ref')}")
         print("Built native libraries:")
         for k, v in libs.items():
             print(f"  {k}: {v} ({v.stat().st_size / (1024 * 1024):.2f} MB)")

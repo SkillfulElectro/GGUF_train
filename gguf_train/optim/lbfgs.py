@@ -65,6 +65,15 @@ class LBFGS(Optimizer):
             for p, s in zip(self._params, saved):
                 p.copy_(s)
 
+    @staticmethod
+    def _history(state: dict, key: str, history_size: int) -> deque:
+        """state[key] as a deque bounded to history_size; a loaded state_dict holds lists."""
+        hist = state.get(key)
+        if not isinstance(hist, deque) or hist.maxlen != history_size:
+            hist = deque(hist or (), maxlen=history_size)
+            state[key] = hist
+        return hist
+
     def step(self, closure):
         if closure is None:
             raise RuntimeError("LBFGS requires a closure")
@@ -77,12 +86,14 @@ class LBFGS(Optimizer):
         tol_change = float(group["tolerance_change"])
         history_size = int(group["history_size"])
 
-        state = self.state.setdefault("global", {})
-        old_dirs = state.setdefault("old_dirs", deque(maxlen=history_size))
-        old_stps = state.setdefault("old_stps", deque(maxlen=history_size))
-        ro = state.setdefault("ro", deque(maxlen=history_size))
+        # Kept under the first parameter, where Optimizer.state_dict() and load_state_dict()
+        # look: the curvature history is what makes this L-BFGS, and a checkpoint has to carry it.
+        state = self.state[self._params[0]]
+        old_dirs = self._history(state, "old_dirs", history_size)
+        old_stps = self._history(state, "old_stps", history_size)
+        ro = self._history(state, "ro", history_size)
 
-        orig_loss = closure()
+        orig_loss = self._evaluate(closure)
         loss = float(orig_loss.item())
         g = self._gather_flat_grad()
         g_norm = float(g.abs().max().item()) if g.numel() > 0 else 0.0
@@ -94,7 +105,9 @@ class LBFGS(Optimizer):
         H_diag = float(state.get("H_diag", 1.0))
         prev_flat_grad = state.get("prev_flat_grad")
         prev_loss = state.get("prev_loss")
-        t = lr
+        # the length of the last step taken along d: together they give the displacement the
+        # next curvature pair is built from
+        t = float(state.get("t", lr))
         d = state.get("d")
 
         while n_iter < max_iter:
@@ -146,8 +159,7 @@ class LBFGS(Optimizer):
                 self._add_grad(step_t, d)
                 if func_evals >= max_eval:
                     break
-                with _autograd_state.enable_grad():
-                    cand = closure()
+                cand = self._evaluate(closure)
                 func_evals += 1
                 cand_loss = float(cand.item())
                 if cand_loss <= prev_loss + 1e-4 * step_t * gtd or group["line_search_fn"] is None:

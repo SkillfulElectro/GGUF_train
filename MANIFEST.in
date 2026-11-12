@@ -3,3 +3,10 @@ recursive-include csrc *.h *.cpp *.txt
 recursive-include third_party/llama.cpp *
 recursive-include gguf_train *.py
 recursive-include torch *.py
+
+# Compiled libraries are per-machine build products (the default build uses
+# -march=native). They belong in wheels, where setup.py's package_data puts them,
+# and must never travel in the *source* distribution: an sdist carrying another
+# machine's binaries makes the native build look up to date and get skipped.
+prune gguf_train/_libs
+global-exclude *.so *.dylib *.dll *.o *.py[cod]

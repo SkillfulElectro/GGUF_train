@@ -42,6 +42,12 @@ static gt_tensor * gt_matmul_2d_ggml(const gt_tensor * a_in, const gt_tensor * b
     gt_tensor * out = gt_tensor_empty(out_ndim, out_shape, out_dtype, a_in->device_type, a_in->device_index);
     if (!out) return nullptr;
     if (out->numel == 0 || out->device_type == GT_DEV_META) return out;
+    if (K == 0) {
+        // (M, 0) @ (0, N): every element is an empty sum. Answered here - ggml takes a tensor
+        // whose first dimension is 0 for a transposed one and aborts the process.
+        gt_fill_scalar_f64(out, 0.0);
+        return out;
+    }
 
     // Native ggml_mul_mat path for F32/F16/BF16/Quantized without complex batch broadcasting
     int64_t batch_a = 1, batch_b = 1, batch_out = 1;
@@ -383,7 +389,7 @@ extern "C" gt_tensor * gt_softmax(const gt_tensor * a, int dim, int is_log) {
 
     // Native ggml_soft_max fast path when dim == last dim, F32, contiguous, <= 4D
     if (!is_log && dim == nd - 1 && a->dtype == GT_F32 && nd <= 4 &&
-        gt_check_contiguous(a) && a->numel > 0 && a->device_type != GT_DEV_META) {
+        gt_ggml_inplace_ok(a) && a->numel > 0 && a->device_type != GT_DEV_META) {
         gt_backend_entry * be = gt_get_backend(a->device_type, a->device_index);
         gt_tensor * out = gt_tensor_empty(nd, a->shape, GT_F32, a->device_type, a->device_index);
         if (be && out) {
@@ -843,6 +849,10 @@ extern "C" gt_tensor * gt_batch_norm(const gt_tensor * x, const gt_tensor * weig
     int64_t C = x->shape[1];
     int64_t spatial = x->numel / std::max<int64_t>(N * C, 1);
     int64_t count = N * spatial;
+    if ((running_mean && running_mean->numel != C) || (running_var && running_var->numel != C)) {
+        gt_set_error("batch_norm: running_mean and running_var must have one element per channel");
+        return nullptr;
+    }
 
     gt_tensor * out = gt_tensor_empty(x->ndim, x->shape, x->dtype, x->device_type, x->device_index);
     gt_tensor * sm = gt_tensor_empty(1, &C, GT_F32, x->device_type, x->device_index);
@@ -859,6 +869,11 @@ extern "C" gt_tensor * gt_batch_norm(const gt_tensor * x, const gt_tensor * weig
     void * rvp = running_var ? hvrv.read_write(running_var) : nullptr;
     void * smp = hvsm.write_empty(sm);
     void * sip = hvsi.write_empty(si);
+    // The running statistics are read and updated in place, so they are addressed through
+    // their own offset and strides: a buffer that is a slice of a larger tensor must neither
+    // be read from, nor written to, the start of that tensor.
+    auto rm_at = [&](int64_t c) { return gt_linear_to_elem_offset(running_mean, c); };
+    auto rv_at = [&](int64_t c) { return gt_linear_to_elem_offset(running_var, c); };
 
     #pragma omp parallel for if (C > 16)
     for (int64_t c = 0; c < C; ++c) {
@@ -879,15 +894,15 @@ extern "C" gt_tensor * gt_batch_norm(const gt_tensor * x, const gt_tensor * weig
             double biased_var = var / (double)std::max<int64_t>(count, 1);
             double unbiased_var = (count > 1) ? (var / (double)(count - 1)) : biased_var;
             if (training && rmp && rvp) {
-                double old_m = gt_read_f64_at(rmp, running_mean->dtype, c);
-                double old_v = gt_read_f64_at(rvp, running_var->dtype, c);
-                gt_write_f64_at(rmp, running_mean->dtype, c, (1.0 - momentum) * old_m + momentum * mean);
-                gt_write_f64_at(rvp, running_var->dtype, c, (1.0 - momentum) * old_v + momentum * unbiased_var);
+                double old_m = gt_read_f64_at(rmp, running_mean->dtype, rm_at(c));
+                double old_v = gt_read_f64_at(rvp, running_var->dtype, rv_at(c));
+                gt_write_f64_at(rmp, running_mean->dtype, rm_at(c), (1.0 - momentum) * old_m + momentum * mean);
+                gt_write_f64_at(rvp, running_var->dtype, rv_at(c), (1.0 - momentum) * old_v + momentum * unbiased_var);
             }
             var = biased_var;
         } else {
-            mean = gt_read_f64_at(rmp, running_mean->dtype, c);
-            var  = gt_read_f64_at(rvp, running_var->dtype, c);
+            mean = gt_read_f64_at(rmp, running_mean->dtype, rm_at(c));
+            var  = gt_read_f64_at(rvp, running_var->dtype, rv_at(c));
         }
         double inv_std = 1.0 / std::sqrt(var + eps);
         gt_write_f64_at(smp, GT_F32, c, mean);
@@ -1001,8 +1016,34 @@ extern "C" gt_tensor * gt_embedding(const gt_tensor * weight, const gt_tensor * 
     if (!out) return nullptr;
     if (indices->numel == 0 || weight->device_type == GT_DEV_META) return out;
 
-    // Fast ggml_get_rows path for F32/F16/Quantized weights when padding_idx < 0
-    if (padding_idx < 0 && (weight->dtype == GT_F32 || weight->dtype == GT_F16 || gt_is_quantized(weight->dtype)) &&
+    // Every index has to name a row of the table. ggml_get_rows asserts on one that does
+    // not - which takes the whole process down - and the general path used to return row 0
+    // for it. Negative indices are not rows either (as in torch).
+    {
+        if (!gt_is_integer(indices->dtype)) {
+            gt_set_error("embedding: indices must be an integer tensor");
+            gt_tensor_free(out);
+            return nullptr;
+        }
+        gt_host_view hv_check;
+        const void * ip_check = hv_check.read(indices);
+        const bool i_contig = gt_check_contiguous(indices);
+        for (int64_t r = 0; r < indices->numel; ++r) {
+            const int64_t at = i_contig ? (indices->offset + r) : gt_linear_to_elem_offset(indices, r);
+            const int64_t idx = gt_read_i64_at(ip_check, indices->dtype, at);
+            if (idx < 0 || idx >= num_emb) {
+                gt_set_error("IndexError: embedding index " + std::to_string(idx) + " is out of range for a table of " +
+                             std::to_string(num_emb) + " rows");
+                gt_tensor_free(out);
+                return nullptr;
+            }
+        }
+    }
+
+    // Fast ggml_get_rows path for F32/Quantized weights when padding_idx < 0. ggml_get_rows
+    // always produces F32, which is what `out` holds for those two; F16 weights keep their
+    // dtype in `out` and therefore take the general path below.
+    if (padding_idx < 0 && (weight->dtype == GT_F32 || gt_is_quantized(weight->dtype)) &&
         gt_check_contiguous(weight) && weight->offset == 0 && weight->device_type == indices->device_type) {
         gt_backend_entry * be = gt_get_backend(weight->device_type, weight->device_index);
         gt_tensor * idx_i32 = (indices->dtype == GT_I32 && gt_check_contiguous(indices) && indices->offset == 0)
@@ -1036,9 +1077,7 @@ extern "C" gt_tensor * gt_embedding(const gt_tensor * weight, const gt_tensor * 
 
     #pragma omp parallel for if (indices->numel > 128)
     for (int64_t r = 0; r < indices->numel; ++r) {
-        int64_t idx = gt_read_i64_at(ip, ic.ptr->dtype, r);
-        if (idx < 0) idx += num_emb;
-        if (idx < 0 || idx >= num_emb) idx = 0;
+        const int64_t idx = gt_read_i64_at(ip, ic.ptr->dtype, r);      // validated above
         for (int64_t c = 0; c < emb_dim; ++c) {
             double v = (idx == padding_idx) ? 0.0 : gt_read_f64_at(wp, wc.ptr->dtype, idx * emb_dim + c);
             gt_write_f64_at(op, out->dtype, r * emb_dim + c, v);
@@ -1109,7 +1148,27 @@ extern "C" gt_tensor * gt_conv2d(const gt_tensor * input, const gt_tensor * weig
         gt_check_contiguous(weight) && weight->offset == 0 &&
         input->device_type == weight->device_type) {
         gt_backend_entry * be = gt_get_backend(input->device_type, input->device_index);
-        if (be) {
+        // The bias joins the graph as a leaf, so it needs to be F32, densely packed, at the
+        // start of its storage and on the input's device. A bias that is not (a slice of a
+        // larger tensor, a strided view, another dtype) is materialised here - it used to be
+        // left out of the sum without a word.
+        gt_tensor * bias_tmp = nullptr;
+        const gt_tensor * bias_use = bias;
+        bool bias_ok = true;
+        if (bias) {
+            if (bias->numel != OC || bias->device_type != input->device_type || bias->device_index != input->device_index) {
+                bias_ok = false;       // the general path reports or handles it
+            } else if (bias->dtype != GT_F32) {
+                bias_tmp = gt_tensor_to_dtype(bias, GT_F32);
+                bias_use = bias_tmp;
+                bias_ok = (bias_tmp != nullptr);
+            } else if (!gt_check_contiguous(bias) || bias->offset != 0) {
+                bias_tmp = gt_tensor_contiguous(bias);
+                bias_use = bias_tmp;
+                bias_ok = (bias_tmp != nullptr);
+            }
+        }
+        if (be && bias_ok) {
             struct ggml_init_params params = {
                 ggml_tensor_overhead() * 24 + ggml_graph_overhead(), nullptr, true
             };
@@ -1124,17 +1183,21 @@ extern "C" gt_tensor * gt_conv2d(const gt_tensor * input, const gt_tensor * weig
                     ggml_reshape_2d(ctx, gw, KW * KH * IC, OC));
                 res = ggml_reshape_4d(ctx, res, OW, OH, N, OC);
                 res = ggml_cont(ctx, ggml_permute(ctx, res, 0, 1, 3, 2)); // -> [OW, OH, OC, N] = PyTorch (N, OC, OH, OW)
-                if (bias && bias->dtype == GT_F32 && gt_check_contiguous(bias) && bias->offset == 0) {
-                    struct ggml_tensor * gb = gt_wrap_ggml_4d(ctx, bias, 1, 1, OC, 1);
+                if (bias_use) {
+                    struct ggml_tensor * gb = gt_wrap_ggml_4d(ctx, bias_use, 1, 1, OC, 1);
                     res = ggml_add(ctx, res, gb);
                 }
                 struct ggml_cgraph * gf = ggml_new_graph(ctx);
                 ggml_build_forward_expand(gf, res);
                 bool ok = gt_exec_ggml_graph(be, ctx, gf, res, out);
                 ggml_free(ctx);
-                if (ok) return out;
+                if (ok) {
+                    if (bias_tmp) gt_tensor_free(bias_tmp);
+                    return out;
+                }
             }
         }
+        if (bias_tmp) gt_tensor_free(bias_tmp);
     }
 
     gt_contig_owner xc(input), wc(weight), bc(bias);
@@ -1928,20 +1991,108 @@ extern "C" gt_tensor * gt_upsample_2d_backward(const gt_tensor * grad_out, int64
 
 // ---------- Cross Entropy Loss ----------
 
+struct gt_ce_layout {
+    int64_t N = 1;        // items in the batch
+    int64_t C = 0;        // classes
+    int64_t spatial = 1;  // elements per item behind the class dimension
+    bool soft = false;    // targets are class probabilities (floating point), not class indices
+};
+
+static std::string gt_ce_shape_str(const gt_tensor * t) {
+    std::string s = "[";
+    for (int i = 0; i < t->ndim; ++i) s += (i ? ", " : "") + std::to_string(t->shape[i]);
+    return s + "]";
+}
+
+// Everything the loops below index by: the class count, the number of targets and the length
+// of the weight vector. The forward and the backward pass both start here, before anything is
+// read or allocated, so a target or weight tensor of the wrong size is an error instead of a
+// read past the end of its buffer.
+static bool gt_cross_entropy_layout(const gt_tensor * logits, const gt_tensor * targets, const gt_tensor * weight,
+                                    double label_smoothing, int reduction, gt_ce_layout & L) {
+    if (!logits || !targets) {
+        gt_set_error("cross_entropy: logits and targets are required");
+        return false;
+    }
+    if (logits->ndim < 1) {
+        gt_set_error("cross_entropy: logits need a class dimension: (C), (N, C) or (N, C, d1, ...)");
+        return false;
+    }
+    if (!gt_is_floating(logits->dtype)) {
+        gt_set_error("cross_entropy: logits must be a floating point tensor");
+        return false;
+    }
+    if (reduction < 0 || reduction > 2) {
+        gt_set_error("cross_entropy: reduction must be 0 (none), 1 (mean) or 2 (sum), got " + std::to_string(reduction));
+        return false;
+    }
+    if (!(label_smoothing >= 0.0 && label_smoothing <= 1.0)) {
+        gt_set_error("cross_entropy: label_smoothing must be between 0.0 and 1.0, got " + std::to_string(label_smoothing));
+        return false;
+    }
+    L.N = (logits->ndim == 1) ? 1 : logits->shape[0];
+    L.C = (logits->ndim == 1) ? logits->shape[0] : logits->shape[1];
+    L.spatial = 1;
+    for (int i = 2; i < logits->ndim; ++i) L.spatial *= logits->shape[i];
+    L.soft = gt_is_floating(targets->dtype);
+
+    if (weight) {
+        if (gt_is_complex(weight->dtype)) {
+            gt_set_error("cross_entropy: weight must be a real tensor");
+            return false;
+        }
+        if (weight->numel != L.C) {
+            gt_set_error("cross_entropy: weight must hold one value per class: expected " + std::to_string(L.C) +
+                         " elements, got a tensor of shape " + gt_ce_shape_str(weight));
+            return false;
+        }
+    }
+    if (L.soft) {
+        bool same = targets->ndim == logits->ndim;
+        for (int i = 0; same && i < logits->ndim; ++i) same = targets->shape[i] == logits->shape[i];
+        if (!same) {
+            gt_set_error("cross_entropy: floating point targets are class probabilities and need the shape of the logits " +
+                         gt_ce_shape_str(logits) + ", got " + gt_ce_shape_str(targets) +
+                         " (class indices must be an integer tensor)");
+            return false;
+        }
+    } else {
+        if (!gt_is_integer(targets->dtype)) {
+            gt_set_error("cross_entropy: targets must be integer class indices or floating point class probabilities");
+            return false;
+        }
+        if (targets->numel != L.N * L.spatial) {
+            gt_set_error("cross_entropy: expected " + std::to_string(L.N * L.spatial) + " class indices as targets for logits of shape " +
+                         gt_ce_shape_str(logits) + ", got a tensor of shape " + gt_ce_shape_str(targets));
+            return false;
+        }
+    }
+    return true;
+}
+
+// Class indices are used to index the logits and the weight vector: every one has to be
+// ignore_index or a class. Checked in one pass before any loss or gradient is computed, in the
+// backward pass too - the targets may have been modified in place since the forward pass.
+static bool gt_cross_entropy_check_targets(const void * tp, int dtype, int64_t count, int64_t C, int64_t ignore_index) {
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t tgt = gt_read_i64_at(tp, dtype, i);
+        if (tgt != ignore_index && (tgt < 0 || tgt >= C)) {
+            gt_set_error("cross_entropy: target " + std::to_string(tgt) + " is out of bounds for " + std::to_string(C) + " classes");
+            return false;
+        }
+    }
+    return true;
+}
+
 extern "C" gt_tensor * gt_cross_entropy_loss(const gt_tensor * logits, const gt_tensor * targets, const gt_tensor * weight,
                                              int64_t ignore_index, double label_smoothing, int reduction) {
     // logits: (C,) or (N, C) or (N, C, d1, ...)
-    // targets: () or (N,) or (N, d1, ...) for integer class indices, OR same shape as logits for soft probabilities
-    if (!logits || !targets || logits->ndim < 1) {
-        gt_set_error("cross_entropy: invalid logits");
-        return nullptr;
-    }
-    bool soft_targets = gt_is_floating(targets->dtype);
-    int64_t N = (logits->ndim == 1) ? 1 : logits->shape[0];
-    int64_t C = (logits->ndim == 1) ? logits->shape[0] : logits->shape[1];
-    int64_t spatial = 1;
-    for (int i = 2; i < logits->ndim; ++i) spatial *= logits->shape[i];
-    int64_t total_items = N * spatial;
+    // targets: integer class indices, one per item - () or (N,) or (N, d1, ...) -
+    //          OR floating point class probabilities with the shape of the logits
+    gt_ce_layout L;
+    if (!gt_cross_entropy_layout(logits, targets, weight, label_smoothing, reduction, L)) return nullptr;
+    const bool soft_targets = L.soft;
+    const int64_t N = L.N, C = L.C, spatial = L.spatial;
 
     int64_t per_shape[GT_MAX_DIMS];
     int per_ndim = 0;
@@ -1951,14 +2102,15 @@ extern "C" gt_tensor * gt_cross_entropy_loss(const gt_tensor * logits, const gt_
         for (int i = 2; i < logits->ndim; ++i) per_shape[per_ndim++] = logits->shape[i];
     }
 
-    gt_tensor * losses = gt_tensor_empty(per_ndim, per_shape, logits->dtype, logits->device_type, logits->device_index);
-    if (!losses) return nullptr;
-
     gt_contig_owner lc(logits), tc(targets), wc(weight);
     gt_host_view hvl, hvt, hvw, hvo;
     const void * lp = hvl.read(lc.ptr);
     const void * tp = hvt.read(tc.ptr);
     const void * wp = wc.ptr ? hvw.read(wc.ptr) : nullptr;
+    if (!soft_targets && !gt_cross_entropy_check_targets(tp, tc.ptr->dtype, N * spatial, C, ignore_index)) return nullptr;
+
+    gt_tensor * losses = gt_tensor_empty(per_ndim, per_shape, logits->dtype, logits->device_type, logits->device_index);
+    if (!losses) return nullptr;
     void * op = hvo.write_empty(losses);
 
     double total_loss = 0.0;
@@ -1996,11 +2148,6 @@ extern "C" gt_tensor * gt_cross_entropy_loss(const gt_tensor * logits, const gt_
                     item_loss = 0.0;
                     item_w = 0.0;
                 } else {
-                    if (tgt < 0 || tgt >= C) {
-                        gt_set_error("Target class index out of bounds in cross_entropy");
-                        gt_tensor_free(losses);
-                        return nullptr;
-                    }
                     double cw = wp ? gt_read_f64_at(wp, wc.ptr->dtype, tgt) : 1.0;
                     if (label_smoothing > 0.0) {
                         double nll = -(get_logit(tgt) - lse);
@@ -2034,22 +2181,27 @@ extern "C" gt_tensor * gt_cross_entropy_loss(const gt_tensor * logits, const gt_
     gt_tensor * scalar = gt_tensor_empty(0, nullptr, logits->dtype, logits->device_type, logits->device_index);
     if (!scalar) return nullptr;
     double res = (reduction == 1) ? (total_weight > 0.0 ? total_loss / total_weight : 0.0) : total_loss;
-    (void)total_items;
     gt_fill_scalar_f64(scalar, res);
     return scalar;
 }
 
 extern "C" gt_tensor * gt_cross_entropy_loss_backward(const gt_tensor * grad_out, const gt_tensor * logits, const gt_tensor * targets,
                                                       const gt_tensor * weight, int64_t ignore_index, double label_smoothing, int reduction) {
-    if (!grad_out || !logits || !targets) return nullptr;
-    bool soft_targets = gt_is_floating(targets->dtype);
-    int64_t N = (logits->ndim == 1) ? 1 : logits->shape[0];
-    int64_t C = (logits->ndim == 1) ? logits->shape[0] : logits->shape[1];
-    int64_t spatial = 1;
-    for (int i = 2; i < logits->ndim; ++i) spatial *= logits->shape[i];
-
-    gt_tensor * dx = gt_tensor_empty(logits->ndim, logits->shape, logits->dtype, logits->device_type, logits->device_index);
-    if (!dx) return nullptr;
+    if (!grad_out) {
+        gt_set_error("cross_entropy: backward needs the gradient of the loss");
+        return nullptr;
+    }
+    gt_ce_layout L;
+    if (!gt_cross_entropy_layout(logits, targets, weight, label_smoothing, reduction, L)) return nullptr;
+    const bool soft_targets = L.soft;
+    const int64_t N = L.N, C = L.C, spatial = L.spatial;
+    // one gradient per item without a reduction, one for the reduced loss otherwise
+    const int64_t grad_elems = (reduction == 0) ? N * spatial : 1;
+    if (grad_out->numel != grad_elems) {
+        gt_set_error("cross_entropy: backward expected a gradient of " + std::to_string(grad_elems) + " element(s), got a tensor of shape " +
+                     gt_ce_shape_str(grad_out));
+        return nullptr;
+    }
 
     gt_contig_owner gc(grad_out), lc(logits), tc(targets), wc(weight);
     gt_host_view hvg, hvl, hvt, hvw, hvd;
@@ -2057,6 +2209,10 @@ extern "C" gt_tensor * gt_cross_entropy_loss_backward(const gt_tensor * grad_out
     const void * lp = hvl.read(lc.ptr);
     const void * tp = hvt.read(tc.ptr);
     const void * wp = wc.ptr ? hvw.read(wc.ptr) : nullptr;
+    if (!soft_targets && !gt_cross_entropy_check_targets(tp, tc.ptr->dtype, N * spatial, C, ignore_index)) return nullptr;
+
+    gt_tensor * dx = gt_tensor_empty(logits->ndim, logits->shape, logits->dtype, logits->device_type, logits->device_index);
+    if (!dx) return nullptr;
     void * dxp = hvd.write_empty(dx);
 
     double total_weight = 0.0;
@@ -2141,89 +2297,127 @@ extern "C" gt_tensor * gt_cross_entropy_loss_backward(const gt_tensor * grad_out
 
 // ---------- RoPE, Flash Attention, SwiGLU (ggml) ----------
 
-extern "C" gt_tensor * gt_rope(const gt_tensor * x, const gt_tensor * pos, int n_dims, int mode, int n_ctx_orig, float freq_base, float freq_scale) {
-    // x: (B, n_heads, seq_len, head_dim) or (seq_len, n_heads, head_dim) -> ggml expects [head_dim, n_heads, seq_len, B]
-    if (!x || !pos || x->ndim < 3 || x->ndim > 4) {
-        gt_set_error("rope expects 3D or 4D x tensor and 1D pos tensor");
+struct gt_rope_layout {
+    int64_t B = 1;  // batch
+    int64_t H = 0;  // heads
+    int64_t S = 0;  // sequence length
+    int64_t D = 0;  // head dimension
+};
+
+static std::string gt_rope_shape_str(const gt_tensor * t) {
+    std::string s = "[";
+    for (int i = 0; i < t->ndim; ++i) s += (i ? ", " : "") + std::to_string(t->shape[i]);
+    return s + "]";
+}
+
+// ggml checks its RoPE arguments with GGML_ASSERT, which ends the process, takes the number of
+// positions on trust, and with n_dims <= 0 never returns. Everything it would trip over is
+// turned into an error here, for the forward and the backward pass alike.
+static bool gt_rope_check(const gt_tensor * x, const gt_tensor * pos, int n_dims, int mode, float freq_base, float freq_scale,
+                          gt_rope_layout & L) {
+    if (!x || !pos) {
+        gt_set_error("rope: x and pos are required");
+        return false;
+    }
+    if (x->ndim < 3 || x->ndim > 4) {
+        gt_set_error("rope: expected x of shape (batch, heads, seq_len, head_dim) or (heads, seq_len, head_dim), got " +
+                     gt_rope_shape_str(x));
+        return false;
+    }
+    if (!gt_is_floating(x->dtype)) {
+        gt_set_error("rope: x must be a floating point tensor");
+        return false;
+    }
+    L.B = (x->ndim == 4) ? x->shape[0] : 1;
+    L.H = (x->ndim == 4) ? x->shape[1] : x->shape[0];
+    L.S = (x->ndim == 4) ? x->shape[2] : x->shape[1];
+    L.D = (x->ndim == 4) ? x->shape[3] : x->shape[2];
+
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        gt_set_error("rope: mode must be 0 (normal) or 2 (NeoX), got " + std::to_string(mode) +
+                     "; the multi-dimensional modes need per-section position ids and are not supported");
+        return false;
+    }
+    if (n_dims < 2 || n_dims % 2 != 0 || n_dims > L.D) {
+        gt_set_error("rope: n_dims must be an even number between 2 and the head dimension " + std::to_string(L.D) + ", got " +
+                     std::to_string(n_dims));
+        return false;
+    }
+    if (!(freq_base > 0.0f) || !std::isfinite(freq_base) || !std::isfinite(freq_scale)) {
+        gt_set_error("rope: freq_base must be positive and finite, and freq_scale finite");
+        return false;
+    }
+    if (pos->ndim != 1 || pos->shape[0] < L.S) {
+        gt_set_error("rope: pos must be a 1-D tensor with a position for each of the " + std::to_string(L.S) +
+                     " sequence elements, got shape " + gt_rope_shape_str(pos));
+        return false;
+    }
+    return true;
+}
+
+// Rotate x (forward) or rotate a gradient back (backward). ggml computes in float32; an input
+// of another floating type is converted, and the result is cast back so that it has the dtype
+// of the input.
+static gt_tensor * gt_rope_run(const gt_tensor * x, const gt_tensor * pos, const gt_rope_layout & L, int n_dims, int mode,
+                               int n_ctx_orig, float freq_base, float freq_scale, bool backward) {
+    if (x->numel == 0) return gt_tensor_empty(x->ndim, x->shape, x->dtype, x->device_type, x->device_index);
+
+    gt_backend_entry * be = gt_get_backend(x->device_type, x->device_index);
+    if (!be) {
+        gt_set_error("rope: no backend for the device of x");
         return nullptr;
     }
-    int64_t B = (x->ndim == 4) ? x->shape[0] : 1;
-    int64_t H = (x->ndim == 4) ? x->shape[1] : x->shape[0];
-    int64_t S = (x->ndim == 4) ? x->shape[2] : x->shape[1];
-    int64_t D = (x->ndim == 4) ? x->shape[3] : x->shape[2];
-
     gt_tensor * out = gt_tensor_empty(x->ndim, x->shape, GT_F32, x->device_type, x->device_index);
     if (!out) return nullptr;
 
-    gt_backend_entry * be = gt_get_backend(x->device_type, x->device_index);
     gt_tensor * xf = (x->dtype == GT_F32 && gt_check_contiguous(x) && x->offset == 0) ? nullptr : gt_tensor_to_dtype(x, GT_F32);
     const gt_tensor * x_use = xf ? xf : x;
     gt_tensor * pf = (pos->dtype == GT_I32 && gt_check_contiguous(pos) && pos->offset == 0) ? nullptr : gt_tensor_to_dtype(pos, GT_I32);
     const gt_tensor * p_use = pf ? pf : pos;
 
-    if (be) {
-        struct ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
-        struct ggml_context * ctx = ggml_init(params);
-        if (ctx) {
-            struct ggml_tensor * gx = gt_wrap_ggml_4d(ctx, x_use, D, S, H, B);
-            struct ggml_tensor * gp = gt_wrap_ggml_4d(ctx, p_use, S, 1, 1, 1);
-            struct ggml_tensor * gx_p = ggml_cont(ctx, ggml_permute(ctx, gx, 0, 2, 1, 3));
-            struct ggml_tensor * g_roped = ggml_rope_ext(ctx, gx_p, gp, nullptr, n_dims, mode, n_ctx_orig, freq_base, freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-            struct ggml_tensor * gout = ggml_cont(ctx, ggml_permute(ctx, g_roped, 0, 2, 1, 3));
-            struct ggml_cgraph * gf = ggml_new_graph(ctx);
-            ggml_build_forward_expand(gf, gout);
-            bool ok = gt_exec_ggml_graph(be, ctx, gf, gout, out);
-            ggml_free(ctx);
-            if (xf) gt_tensor_free(xf);
-            if (pf) gt_tensor_free(pf);
-            if (ok) return out;
-        }
+    bool ok = false;
+    gt_set_error("");
+    struct ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    struct ggml_context * ctx = (x_use && p_use) ? ggml_init(params) : nullptr;
+    if (ctx) {
+        // ggml wants [head_dim, heads, seq_len, batch]; the first seq_len positions are used
+        struct ggml_tensor * gx = gt_wrap_ggml_4d(ctx, x_use, L.D, L.S, L.H, L.B);
+        struct ggml_tensor * gp = gt_wrap_ggml_4d(ctx, p_use, L.S, 1, 1, 1);
+        struct ggml_tensor * gx_p = ggml_cont(ctx, ggml_permute(ctx, gx, 0, 2, 1, 3));
+        struct ggml_tensor * g_roped = backward
+            ? ggml_rope_ext_back(ctx, gx_p, gp, nullptr, n_dims, mode, n_ctx_orig, freq_base, freq_scale, 0.0f, 1.0f, 0.0f, 0.0f)
+            : ggml_rope_ext(ctx, gx_p, gp, nullptr, n_dims, mode, n_ctx_orig, freq_base, freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+        struct ggml_tensor * gout = ggml_cont(ctx, ggml_permute(ctx, g_roped, 0, 2, 1, 3));
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, gout);
+        ok = gt_exec_ggml_graph(be, ctx, gf, gout, out);
+        ggml_free(ctx);
     }
     if (xf) gt_tensor_free(xf);
     if (pf) gt_tensor_free(pf);
+    if (!ok) {
+        const std::string detail = gt_last_error();
+        gt_tensor_free(out);
+        gt_set_error("rope: " + (detail.empty() ? std::string("ggml execution failed") : detail));
+        return nullptr;
+    }
+    if (x->dtype == GT_F32) return out;
+    gt_tensor * cast = gt_tensor_to_dtype(out, x->dtype);
     gt_tensor_free(out);
-    gt_set_error("rope execution failed");
-    return nullptr;
+    return cast;
+}
+
+extern "C" gt_tensor * gt_rope(const gt_tensor * x, const gt_tensor * pos, int n_dims, int mode, int n_ctx_orig, float freq_base, float freq_scale) {
+    // x: (batch, heads, seq_len, head_dim) or (heads, seq_len, head_dim); pos: (seq_len,) or longer
+    gt_rope_layout L;
+    if (!gt_rope_check(x, pos, n_dims, mode, freq_base, freq_scale, L)) return nullptr;
+    return gt_rope_run(x, pos, L, n_dims, mode, n_ctx_orig, freq_base, freq_scale, false);
 }
 
 extern "C" gt_tensor * gt_rope_backward(const gt_tensor * grad_out, const gt_tensor * pos, int n_dims, int mode, int n_ctx_orig, float freq_base, float freq_scale) {
-    if (!grad_out || !pos || grad_out->ndim < 3 || grad_out->ndim > 4) return nullptr;
-    int64_t B = (grad_out->ndim == 4) ? grad_out->shape[0] : 1;
-    int64_t H = (grad_out->ndim == 4) ? grad_out->shape[1] : grad_out->shape[0];
-    int64_t S = (grad_out->ndim == 4) ? grad_out->shape[2] : grad_out->shape[1];
-    int64_t D = (grad_out->ndim == 4) ? grad_out->shape[3] : grad_out->shape[2];
-
-    gt_tensor * out = gt_tensor_empty(grad_out->ndim, grad_out->shape, GT_F32, grad_out->device_type, grad_out->device_index);
-    if (!out) return nullptr;
-
-    gt_backend_entry * be = gt_get_backend(grad_out->device_type, grad_out->device_index);
-    gt_tensor * gf_t = (grad_out->dtype == GT_F32 && gt_check_contiguous(grad_out) && grad_out->offset == 0) ? nullptr : gt_tensor_to_dtype(grad_out, GT_F32);
-    const gt_tensor * g_use = gf_t ? gf_t : grad_out;
-    gt_tensor * pf = (pos->dtype == GT_I32 && gt_check_contiguous(pos) && pos->offset == 0) ? nullptr : gt_tensor_to_dtype(pos, GT_I32);
-    const gt_tensor * p_use = pf ? pf : pos;
-
-    if (be) {
-        struct ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
-        struct ggml_context * ctx = ggml_init(params);
-        if (ctx) {
-            struct ggml_tensor * gx = gt_wrap_ggml_4d(ctx, g_use, D, S, H, B);
-            struct ggml_tensor * gp = gt_wrap_ggml_4d(ctx, p_use, S, 1, 1, 1);
-            struct ggml_tensor * gx_p = ggml_cont(ctx, ggml_permute(ctx, gx, 0, 2, 1, 3));
-            struct ggml_tensor * g_roped = ggml_rope_ext_back(ctx, gx_p, gp, nullptr, n_dims, mode, n_ctx_orig, freq_base, freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-            struct ggml_tensor * gout = ggml_cont(ctx, ggml_permute(ctx, g_roped, 0, 2, 1, 3));
-            struct ggml_cgraph * gf = ggml_new_graph(ctx);
-            ggml_build_forward_expand(gf, gout);
-            bool ok = gt_exec_ggml_graph(be, ctx, gf, gout, out);
-            ggml_free(ctx);
-            if (gf_t) gt_tensor_free(gf_t);
-            if (pf) gt_tensor_free(pf);
-            if (ok) return out;
-        }
-    }
-    if (gf_t) gt_tensor_free(gf_t);
-    if (pf) gt_tensor_free(pf);
-    gt_tensor_free(out);
-    return nullptr;
+    gt_rope_layout L;
+    if (!gt_rope_check(grad_out, pos, n_dims, mode, freq_base, freq_scale, L)) return nullptr;
+    return gt_rope_run(grad_out, pos, L, n_dims, mode, n_ctx_orig, freq_base, freq_scale, true);
 }
 
 extern "C" gt_tensor * gt_flash_attention(const gt_tensor * q, const gt_tensor * k, const gt_tensor * v, const gt_tensor * mask, float scale, int is_causal) {
@@ -2237,6 +2431,27 @@ extern "C" gt_tensor * gt_flash_attention(const gt_tensor * q, const gt_tensor *
     if (H % H_kv != 0) { gt_set_error("flash_attention: num_heads must be divisible by num_kv_heads"); return nullptr; }
     int64_t group_sz = H / H_kv;
     if (scale <= 0.0f) scale = 1.0f / std::sqrt((float)D);
+    if (k->shape[0] != B || v->shape[0] != B || v->shape[1] != H_kv || v->shape[2] != S || k->shape[3] != D) {
+        gt_set_error("flash_attention: q (B, H, L, D), k (B, H_kv, S, D) and v (B, H_kv, S, Dv) do not fit together");
+        return nullptr;
+    }
+    if (mask) {
+        // (L, S) or (B, H, L, S), every dimension either 1 or the full size: the loop below
+        // indexes the mask by these sizes
+        const int64_t want[4] = {B, H, L, S};
+        bool fits = mask->ndim == 2 || mask->ndim == 4;
+        for (int i = 0; fits && i < mask->ndim; ++i) {
+            const int64_t m = mask->shape[i];
+            fits = (m == 1 || m == want[4 - mask->ndim + i]);
+        }
+        if (!fits) {
+            std::string shape = "[";
+            for (int i = 0; i < mask->ndim; ++i) shape += (i ? ", " : "") + std::to_string(mask->shape[i]);
+            gt_set_error("flash_attention: attn_mask of shape " + shape + "] cannot be broadcast to the attention weights [" +
+                         std::to_string(B) + ", " + std::to_string(H) + ", " + std::to_string(L) + ", " + std::to_string(S) + "]");
+            return nullptr;
+        }
+    }
 
     int64_t osh[4] = {B, H, L, Dv};
     gt_tensor * out = gt_tensor_empty(4, osh, q->dtype, q->device_type, q->device_index);
@@ -2382,11 +2597,16 @@ extern "C" int gt_adamw_step(gt_tensor * param, const gt_tensor * grad, gt_tenso
     double bias_corr1 = 1.0 - std::pow(beta1, (double)step);
     double bias_corr2 = 1.0 - std::pow(beta2, (double)step);
     bool p_contig = gt_check_contiguous(param), g_contig = gt_check_contiguous(grad);
+    // Every tensor is addressed through its own offset and strides - the state buffers too
+    bool m_contig = gt_check_contiguous(exp_avg), v_contig = gt_check_contiguous(exp_avg_sq);
+    bool mx_contig = mxp ? gt_check_contiguous(max_exp_avg_sq) : true;
 
     #pragma omp parallel for if (param->numel > 4096)
     for (int64_t i = 0; i < param->numel; ++i) {
         int64_t pidx = p_contig ? (param->offset + i) : gt_linear_to_elem_offset(param, i);
         int64_t gidx = g_contig ? (grad->offset + i) : gt_linear_to_elem_offset(grad, i);
+        int64_t midx = m_contig ? (exp_avg->offset + i) : gt_linear_to_elem_offset(exp_avg, i);
+        int64_t vidx = v_contig ? (exp_avg_sq->offset + i) : gt_linear_to_elem_offset(exp_avg_sq, i);
         double w = gt_read_f64_at(pp, param->dtype, pidx);
         double g = gt_read_f64_at(gp, grad->dtype, gidx);
         if (decoupled_wd) {
@@ -2394,15 +2614,16 @@ extern "C" int gt_adamw_step(gt_tensor * param, const gt_tensor * grad, gt_tenso
         } else {
             if (weight_decay != 0.0) g += weight_decay * w;
         }
-        double m = beta1 * gt_read_f64_at(mp, exp_avg->dtype, i) + (1.0 - beta1) * g;
-        double v = beta2 * gt_read_f64_at(vp, exp_avg_sq->dtype, i) + (1.0 - beta2) * g * g;
-        gt_write_f64_at(mp, exp_avg->dtype, i, m);
-        gt_write_f64_at(vp, exp_avg_sq->dtype, i, v);
+        double m = beta1 * gt_read_f64_at(mp, exp_avg->dtype, midx) + (1.0 - beta1) * g;
+        double v = beta2 * gt_read_f64_at(vp, exp_avg_sq->dtype, vidx) + (1.0 - beta2) * g * g;
+        gt_write_f64_at(mp, exp_avg->dtype, midx, m);
+        gt_write_f64_at(vp, exp_avg_sq->dtype, vidx, v);
 
         double denom;
         if (amsgrad && mxp) {
-            double vmax = std::max(gt_read_f64_at(mxp, max_exp_avg_sq->dtype, i), v);
-            gt_write_f64_at(mxp, max_exp_avg_sq->dtype, i, vmax);
+            int64_t mxidx = mx_contig ? (max_exp_avg_sq->offset + i) : gt_linear_to_elem_offset(max_exp_avg_sq, i);
+            double vmax = std::max(gt_read_f64_at(mxp, max_exp_avg_sq->dtype, mxidx), v);
+            gt_write_f64_at(mxp, max_exp_avg_sq->dtype, mxidx, vmax);
             denom = std::sqrt(vmax / bias_corr2) + eps;
         } else {
             denom = std::sqrt(v / bias_corr2) + eps;
@@ -2462,6 +2683,7 @@ extern "C" int gt_sgd_step(gt_tensor * param, const gt_tensor * grad, gt_tensor 
     const void * gp = hvg.read(grad);
     void * mp = momentum_buf ? hvm.read_write(momentum_buf) : nullptr;
     bool p_contig = gt_check_contiguous(param), g_contig = gt_check_contiguous(grad);
+    bool m_contig = mp ? gt_check_contiguous(momentum_buf) : true;
 
     #pragma omp parallel for if (param->numel > 4096)
     for (int64_t i = 0; i < param->numel; ++i) {
@@ -2471,13 +2693,14 @@ extern "C" int gt_sgd_step(gt_tensor * param, const gt_tensor * grad, gt_tensor 
         double d_p = gt_read_f64_at(gp, grad->dtype, gidx);
         if (weight_decay != 0.0) d_p += weight_decay * w;
         if (momentum != 0.0 && mp) {
+            int64_t midx = m_contig ? (momentum_buf->offset + i) : gt_linear_to_elem_offset(momentum_buf, i);
             double buf;
             if (first_step) {
                 buf = d_p;
             } else {
-                buf = gt_read_f64_at(mp, momentum_buf->dtype, i) * momentum + (1.0 - dampening) * d_p;
+                buf = gt_read_f64_at(mp, momentum_buf->dtype, midx) * momentum + (1.0 - dampening) * d_p;
             }
-            gt_write_f64_at(mp, momentum_buf->dtype, i, buf);
+            gt_write_f64_at(mp, momentum_buf->dtype, midx, buf);
             d_p = nesterov ? (d_p + momentum * buf) : buf;
         }
         w -= lr * d_p;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import warnings
 from pathlib import Path
 
 from .. import _C, _autograd_state, _device as _dev, _dtype as _dt
@@ -13,6 +14,14 @@ from .._tensor import Tensor, _from_python
 from ..nn import functional as F, init
 from ..nn.modules.module import Module
 from ..nn.parameter import Parameter
+
+
+# What the native tokenizer calls return when they fail outright (rather than when the
+# output buffer is merely too small, which is reported as the negated size needed).
+_INT32_MIN = -(2**31)
+
+# llama.cpp sizes a context in multiples of this many tokens, see LlamaContext.finetune.
+_TRAIN_WINDOW_MULTIPLE = 256
 
 
 class LlamaModel:
@@ -89,14 +98,23 @@ class LlamaModel:
     def metadata(self) -> dict[str, str]:
         ll = _C.llama_lib()
         n = int(ll.gt_llama_model_meta_count(self._ptr))
-        kbuf = ctypes.create_string_buffer(512)
-        vbuf = ctypes.create_string_buffer(2048)
+
+        def text(read) -> bytes:
+            # llama.cpp reports the full length, so a value that did not fit is read again
+            # into a buffer that holds it (chat templates run to many kilobytes).
+            size = 512
+            while True:
+                buf = ctypes.create_string_buffer(size)
+                needed = int(read(buf, size))
+                if needed < size:
+                    return buf.value
+                size = needed + 1
+
         out = {}
         for i in range(n):
-            ll.gt_llama_model_meta_key(self._ptr, i, kbuf, 512)
-            key = kbuf.value.decode("utf-8", errors="replace")
-            ll.gt_llama_model_meta_val(self._ptr, kbuf.value, vbuf, 2048)
-            out[key] = vbuf.value.decode("utf-8", errors="replace")
+            key = text(lambda buf, size: ll.gt_llama_model_meta_key(self._ptr, i, buf, size))
+            value = text(lambda buf, size: ll.gt_llama_model_meta_val(self._ptr, key, buf, size))
+            out[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
         return out
 
     def tokenize(self, text: str, add_special: bool = True, parse_special: bool = True) -> list[int]:
@@ -105,10 +123,13 @@ class LlamaModel:
         cap = max(len(b) + 16, 64)
         arr = (ctypes.c_int32 * cap)()
         n = int(ll.gt_llama_tokenize(self._ptr, b, len(b), arr, cap, 1 if add_special else 0, 1 if parse_special else 0))
-        if n < 0:
+        if _INT32_MIN < n < 0:
+            # The buffer was too small; -n is the number of tokens needed.
             cap = -n + 4
             arr = (ctypes.c_int32 * cap)()
             n = int(ll.gt_llama_tokenize(self._ptr, b, len(b), arr, cap, 1 if add_special else 0, 1 if parse_special else 0))
+        if n < 0:
+            raise RuntimeError(_C.last_error() or "llama tokenize failed")
         return [int(arr[i]) for i in range(n)]
 
     def detokenize(self, tokens: list[int], remove_special: bool = False, unparse_special: bool = True) -> str:
@@ -120,10 +141,13 @@ class LlamaModel:
         cap = max(n * 16, 256)
         buf = ctypes.create_string_buffer(cap)
         rc = int(ll.gt_llama_detokenize(self._ptr, arr, n, buf, cap, 1 if remove_special else 0, 1 if unparse_special else 0))
-        if rc < 0:
+        if _INT32_MIN < rc < 0:
+            # The buffer was too small; -rc is the number of bytes needed.
             cap = -rc + 16
             buf = ctypes.create_string_buffer(cap)
             rc = int(ll.gt_llama_detokenize(self._ptr, arr, n, buf, cap, 1 if remove_special else 0, 1 if unparse_special else 0))
+        if rc < 0:
+            raise RuntimeError(_C.last_error() or "llama detokenize failed")
         return buf.raw[:rc].decode("utf-8", errors="replace")
 
     def new_context(self, n_ctx: int = 512, n_batch: int = 512, n_threads: int = 4, embeddings: bool = False) -> LlamaContext:
@@ -210,10 +234,30 @@ class LlamaContext:
         val_split: float = 0.0,
         optimizer: str = "adamw",
     ) -> None:
+        """Fine-tune the model in place on next-token prediction with llama.cpp's native trainer.
+
+        ``tokens`` holds equal-length token sequences. Every sequence is trained on as an
+        independent sample: token ``k`` is predicted from tokens ``0..k-1`` of the same
+        sequence, and nothing beyond the sequence (no padding) enters the loss. Sequences
+        longer than this context's ``n_ctx + 1`` tokens are truncated to that length.
+
+        Training runs in a temporary llama.cpp context, so this context stays usable for
+        inference afterwards (its KV cache is cleared, since the weights changed) and
+        ``finetune`` can be called repeatedly.
+
+        Limits inherited from llama.cpp's trainer:
+
+        * The model must be loaded with ``use_mmap=False``; memory-mapped weights are read-only.
+        * One optimizer step is taken per sequence, so ``batch_size`` must be 1.
+        * Only F32 tensors are trained (quantized tensors and the token embedding stay frozen).
+        * The attention key/value projections only receive gradients when a sequence fills the
+          whole training window, i.e. when it has ``256 * k + 1`` tokens. Other lengths train
+          the remaining weights and emit a warning.
+        """
         if isinstance(tokens, Tensor):
             rows = tokens.tolist()
         else:
-            rows = list(tokens)
+            rows = [list(row) for row in tokens]
         if not rows or not rows[0] or len(rows[0]) < 2:
             raise ValueError("tokens must contain at least one sequence of two or more tokens")
         n_samples = len(rows)
@@ -224,6 +268,27 @@ class LlamaContext:
             raise ValueError("val_split must be in [0, 1)")
         if optimizer.lower() not in ("adamw", "sgd"):
             raise ValueError("optimizer must be 'adamw' or 'sgd'")
+        if int(batch_size) != 1:
+            raise ValueError(
+                f"batch_size={batch_size} is not supported: llama.cpp's trainer takes one optimizer step per "
+                "sequence and cannot combine several sequences into one step; pass batch_size=1"
+            )
+        if not (math.isfinite(lr) and lr > 0.0):
+            raise ValueError("lr must be a positive finite number")
+        if not 0.0 <= weight_decay <= 1.0:
+            raise ValueError("weight_decay must be in [0, 1]")
+        if int(epochs) < 0:
+            raise ValueError("epochs must be non-negative")
+
+        usable = min(seq_len - 1, self.n_ctx)
+        if int(epochs) > 0 and usable % _TRAIN_WINDOW_MULTIPLE != 0:
+            warnings.warn(
+                f"finetune: {usable} trained positions per sequence do not fill a llama.cpp training window "
+                f"(a multiple of {_TRAIN_WINDOW_MULTIPLE} tokens), so the attention key/value projection weights "
+                f"receive no gradient in this run. Use sequences of {_TRAIN_WINDOW_MULTIPLE}*k + 1 tokens to train "
+                "all weights.",
+                stacklevel=2,
+            )
         flat = [int(tok) for row in rows for tok in row]
         arr = (ctypes.c_int32 * len(flat))(*flat)
         opt_code = 1 if optimizer.lower() == "sgd" else 0
@@ -236,15 +301,47 @@ class LlamaContext:
 
 
 class OptGraph:
-    """High-speed native ggml_opt_graph builder and trainer (zero Python loop overhead)."""
+    """Static graph trained natively by ggml_opt (no Python in the training loop).
+
+    Build the graph with :meth:`input`, :meth:`param` and the operation methods, each of
+    which returns a node id, then call :meth:`fit`. The parameters are float32 tensors and
+    are updated in place.
+
+    ``input`` must be declared as ``(nbatch_physical, features)``; ``fit`` feeds it one
+    batch of dataset rows at a time. A graph can be fitted any number of times.
+    """
+
+    _LOSSES = {"mean": 0, "sum": 1, "cross_entropy": 2, "mse": 3}
+    _OPTIMIZERS = {"adamw": 0, "sgd": 1}
+    # Only operations ggml can differentiate. ("gelu" is not among them: ggml has no
+    # backward pass for it and no exact way to spell it with operations that have one.)
+    _UNARY = {
+        "relu": _C.UNARY_RELU,
+        "silu": _C.UNARY_SILU,
+        "sigmoid": _C.UNARY_SIGMOID,
+        "tanh": _C.UNARY_TANH,
+        "softplus": _C.UNARY_SOFTPLUS,
+        "exp": _C.UNARY_EXP,
+        "log": _C.UNARY_LOG,
+        "square": _C.UNARY_SQUARE,
+        "sqrt": _C.UNARY_SQRT,
+        "neg": _C.UNARY_NEG,
+        "abs": _C.UNARY_ABS,
+    }
 
     def __init__(self, device: str | _dev.device = "cpu", loss_type: str = "mse", optimizer: str = "adamw", nbatch_physical: int = 32, nbatch_logical: int = 32) -> None:
         _dev.as_device(device)
-        loss_map = {"mean": 0, "sum": 1, "cross_entropy": 2, "mse": 3}
-        opt_map = {"adamw": 0, "sgd": 1}
-        opt_code = opt_map.get(optimizer.lower(), 0)
+        loss_code = self._LOSSES.get(str(loss_type).lower())
+        if loss_code is None:
+            raise ValueError(f"OptGraph: unknown loss_type {loss_type!r}; expected one of {sorted(self._LOSSES)}")
+        opt_code = self._OPTIMIZERS.get(str(optimizer).lower())
+        if opt_code is None:
+            raise ValueError(f"OptGraph: unknown optimizer {optimizer!r}; expected one of {sorted(self._OPTIMIZERS)}")
+        if int(nbatch_physical) < 1:
+            raise ValueError(f"OptGraph: nbatch_physical must be at least 1, got {nbatch_physical}")
+        self.loss_type = str(loss_type).lower()
         self._ptr = _C.check_ptr(
-            _C.lib.gt_opt_graph_create(loss_map[loss_type.lower()], opt_code, int(nbatch_physical), int(nbatch_logical)),
+            _C.lib.gt_opt_graph_create(loss_code, opt_code, int(nbatch_physical), int(nbatch_logical)),
             "opt_graph_create",
         )
 
@@ -254,50 +351,75 @@ class OptGraph:
             _C.lib.gt_opt_graph_free(ptr)
             self._ptr = 0
 
+    @staticmethod
+    def _node(node_id: int) -> int:
+        """Node ids are non-negative; the native builders return -1 after recording an error."""
+        if node_id < 0:
+            raise RuntimeError(_C.last_error() or "OptGraph: the native graph builder failed")
+        return int(node_id)
+
     def input(self, shape: tuple[int, ...]) -> int:
-        return int(_C.lib.gt_opt_graph_input(self._ptr, len(shape), _c_i64_arr(shape)))
+        shape = tuple(int(d) for d in shape)
+        return self._node(_C.lib.gt_opt_graph_input(self._ptr, len(shape), _c_i64_arr(shape)))
 
     def param(self, tensor: Tensor) -> int:
-        return int(_C.lib.gt_opt_graph_param(self._ptr, tensor._ptr))
+        if not isinstance(tensor, Tensor):
+            raise TypeError(f"OptGraph.param expects a Tensor, got {type(tensor).__name__}")
+        return self._node(_C.lib.gt_opt_graph_param(self._ptr, tensor._ptr))
 
     def linear(self, x_id: int, w_id: int, b_id: int = -1) -> int:
-        return int(_C.lib.gt_opt_graph_linear(self._ptr, x_id, w_id, b_id))
+        return self._node(_C.lib.gt_opt_graph_linear(self._ptr, int(x_id), int(w_id), int(b_id)))
 
     def unary(self, x_id: int, op: str) -> int:
-        op_map = {"relu": _C.UNARY_RELU, "silu": _C.UNARY_SILU, "gelu": _C.UNARY_GELU, "tanh": _C.UNARY_TANH, "sigmoid": _C.UNARY_SIGMOID}
-        return int(_C.lib.gt_opt_graph_unary(self._ptr, x_id, op_map[op]))
+        code = self._UNARY.get(str(op).lower())
+        if code is None:
+            raise ValueError(f"OptGraph.unary: {op!r} cannot be trained through (ggml has no backward pass for it); supported: {sorted(self._UNARY)}")
+        return self._node(_C.lib.gt_opt_graph_unary(self._ptr, int(x_id), code))
 
     def add(self, a_id: int, b_id: int) -> int:
-        return int(_C.lib.gt_opt_graph_add(self._ptr, a_id, b_id))
+        return self._node(_C.lib.gt_opt_graph_add(self._ptr, int(a_id), int(b_id)))
 
     def mul(self, a_id: int, b_id: int) -> int:
-        return int(_C.lib.gt_opt_graph_mul(self._ptr, a_id, b_id))
+        return self._node(_C.lib.gt_opt_graph_mul(self._ptr, int(a_id), int(b_id)))
 
     def rms_norm(self, x_id: int, w_id: int = -1, eps: float = 1e-6) -> int:
-        return int(_C.lib.gt_opt_graph_rms_norm(self._ptr, x_id, w_id, float(eps)))
+        return self._node(_C.lib.gt_opt_graph_rms_norm(self._ptr, int(x_id), int(w_id), float(eps)))
 
     def softmax(self, x_id: int) -> int:
-        return int(_C.lib.gt_opt_graph_softmax(self._ptr, x_id))
+        return self._node(_C.lib.gt_opt_graph_softmax(self._ptr, int(x_id)))
 
-    def fit(self, output_id: int, dataset_x: Tensor, dataset_y: Tensor, epochs: int = 10, lr: float = 1e-3, wd: float = 0.0, val_split: float = 0.0, silent: bool = True) -> tuple[float, float]:
+    def fit(self, output_id: int, dataset_x: Tensor, dataset_y: Tensor | None = None, epochs: int = 10, lr: float = 1e-3, wd: float = 0.0, val_split: float = 0.0, silent: bool = True) -> tuple[float, float]:
+        """Train the parameters ``output_id`` depends on; returns ``(train_loss, val_loss)`` of the last epoch.
+
+        ``dataset_x`` has one row per sample; rows beyond a multiple of ``nbatch_physical``
+        are dropped. ``dataset_y`` holds one row of targets per sample for the ``"mse"`` and
+        ``"cross_entropy"`` losses (one-hot or probability rows for the latter) and must be
+        left out for ``"mean"`` and ``"sum"``, which are computed from the output alone.
+        ``val_loss`` is 0.0 when no batches are held out.
+        """
+        if not isinstance(dataset_x, Tensor):
+            raise TypeError(f"OptGraph.fit expects dataset_x to be a Tensor, got {type(dataset_x).__name__}")
+        if dataset_y is not None and not isinstance(dataset_y, Tensor):
+            raise TypeError(f"OptGraph.fit expects dataset_y to be a Tensor or None, got {type(dataset_y).__name__}")
+        if int(epochs) < 0:
+            raise ValueError(f"OptGraph.fit: epochs must be non-negative, got {epochs}")
         t_loss = ctypes.c_double(0.0)
         v_loss = ctypes.c_double(0.0)
-        _C.check_rc(
-            _C.lib.gt_opt_graph_fit(
-                self._ptr,
-                int(output_id),
-                dataset_x._ptr,
-                dataset_y._ptr,
-                int(epochs),
-                float(lr),
-                float(wd),
-                float(val_split),
-                1 if silent else 0,
-                ctypes.byref(t_loss),
-                ctypes.byref(v_loss),
-            ),
-            "opt_graph_fit",
+        rc = _C.lib.gt_opt_graph_fit(
+            self._ptr,
+            int(output_id),
+            dataset_x._ptr,
+            dataset_y._ptr if dataset_y is not None else None,
+            int(epochs),
+            float(lr),
+            float(wd),
+            float(val_split),
+            1 if silent else 0,
+            ctypes.byref(t_loss),
+            ctypes.byref(v_loss),
         )
+        if rc != 0:
+            raise RuntimeError(_C.last_error() or f"OptGraph.fit failed with code {rc}")
         return float(t_loss.value), float(v_loss.value)
 
 

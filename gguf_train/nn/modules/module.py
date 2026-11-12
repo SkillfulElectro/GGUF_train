@@ -22,6 +22,64 @@ class _HookHandle:
         self._hooks.pop(self._id, None)
 
 
+class _ApplyOnce:
+    """A conversion function that remembers what it has converted.
+
+    Module._apply walks every module of a tree and converts what it finds. The same Parameter
+    or buffer can be found more than once - tied embedding / output weights, a module that is
+    registered twice. Each distinct tensor is converted exactly once, and a Parameter is
+    converted in place, so that everything which shared it before still shares it afterwards.
+    """
+
+    def __init__(self, fn) -> None:
+        self.fn = fn
+        # id(tensor) -> (tensor, converted). The original is kept alive: a freed tensor's id
+        # could be handed to another one while the walk is still going on.
+        self._done: dict[int, tuple] = {}
+
+    def __call__(self, t):
+        hit = self._done.get(id(t))
+        if hit is not None:
+            return hit[1]
+        out = self.fn(t)
+        self._done[id(t)] = (t, out)
+        self._done.setdefault(id(out), (out, out))
+        return out
+
+    def parameter(self, p: Parameter) -> None:
+        """Convert `p` and its gradient in place; the Parameter object is not replaced."""
+        if id(p) in self._done:
+            return
+        self._done[id(p)] = (p, p)
+        new = self.fn(p)
+        if new is not p:
+            p._rebind(new)
+        grad = p._grad
+        if grad is not None:
+            p._grad = self(grad)
+
+
+def _to_arguments(args, kwargs):
+    """(device, dtype) of a Module.to() call, which takes the same forms as Tensor.to()."""
+    unknown = set(kwargs) - {"dtype", "device", "non_blocking", "copy", "memory_format"}
+    if unknown:
+        raise TypeError(f"Module.to() got unexpected keyword arguments: {sorted(unknown)}")
+    dtype = kwargs.get("dtype")
+    device = kwargs.get("device")
+    for a in args:
+        if a is None:
+            continue
+        if isinstance(a, _dt.dtype):
+            dtype = a
+        elif isinstance(a, (_dev.device, str)):
+            device = a
+        elif isinstance(a, Tensor):
+            dtype, device = a.dtype, a.device
+        else:
+            raise TypeError(f"Unsupported argument to Module.to: {a!r}")
+    return device, dtype
+
+
 class Module:
     """Base class for all neural network modules."""
 
@@ -259,22 +317,45 @@ class Module:
         fn(self)
         return self
 
-    def _apply(self, fn):
-        for m in self.children():
-            m._apply(fn)
+    def _apply(self, fn, recurse: bool = True):
+        """Convert every parameter and buffer with `fn` (dtype, device).
+
+        Parameters are converted in place: the Parameter objects stay, so weights tied between
+        modules stay tied, optimizers keep the parameters they were given, and `.grad` is
+        converted along with the value. Each distinct tensor is converted once.
+        """
+        if not isinstance(fn, _ApplyOnce):
+            fn = _ApplyOnce(fn)
+        if recurse:
+            for m in self.children():
+                m._apply(fn)
         with _autograd_state.no_grad():
-            for k, p in self._parameters.items():
+            for p in self._parameters.values():
                 if p is not None:
-                    new_t = fn(p)
-                    if new_t is not p:
-                        self._parameters[k] = Parameter(new_t, requires_grad=p.requires_grad)
+                    fn.parameter(p)
             for k, b in self._buffers.items():
                 if b is not None:
                     self._buffers[k] = fn(b)
         return self
 
     def to(self, *args, **kwargs):
-        return self._apply(lambda t: t.to(*args, **kwargs))
+        device, dtype = _to_arguments(args, kwargs)
+        if dtype is not None:
+            dtype = _dt.as_dtype(dtype)
+            if not (dtype.is_floating_point or dtype.is_complex):
+                raise TypeError(f"nn.Module.to only accepts floating point or complex dtypes, but got desired dtype={dtype}")
+
+        def convert(t: Tensor) -> Tensor:
+            # The dtype is for floating point and complex tensors. Integer and bool buffers -
+            # counters, indices, masks - keep theirs and only follow the device.
+            kw = {}
+            if device is not None:
+                kw["device"] = device
+            if dtype is not None and (t.is_floating_point() or t.is_complex()):
+                kw["dtype"] = dtype
+            return t.to(**kw) if kw else t
+
+        return self._apply(convert)
 
     def cpu(self):
         return self._apply(lambda t: t.cpu())
@@ -311,9 +392,20 @@ class Module:
                 m.state_dict(destination=destination, prefix=prefix + name + ".", keep_vars=keep_vars)
         return destination
 
+    def _legacy_state_dict_keys(self) -> dict:
+        """{old key: current key}, relative to this module, for state dicts written before a
+        module changed the names of its parameters. load_state_dict() accepts the old names."""
+        return {}
+
     def load_state_dict(self, state_dict: dict, strict: bool = True, assign: bool = False):
         (assign,)
         own = self.state_dict(keep_vars=True)
+        renames = {}
+        for prefix, mod in self.named_modules():
+            for old, new in mod._legacy_state_dict_keys().items():
+                renames[f"{prefix}.{old}" if prefix else old] = f"{prefix}.{new}" if prefix else new
+        if any(k in renames and k not in own for k in state_dict):
+            state_dict = OrderedDict((k if k in own else renames.get(k, k), v) for k, v in state_dict.items())
         missing = []
         unexpected = []
         with _autograd_state.no_grad():

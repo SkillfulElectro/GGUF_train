@@ -8,6 +8,7 @@ import math as _math
 from . import _C, _autograd_state, _compat, _device, _dtype
 from . import amp, autograd, backends, cpu, cuda, distributions, fft, fx, gguf, jit, linalg, llama, mps, nn, onnx, optim, profiler, random, special, testing, utils
 from ._autograd_engine import Function, backward, grad
+from .amp import autocast, get_autocast_dtype, is_autocast_enabled
 from ._autograd_state import (
     detect_anomaly,
     enable_grad,
@@ -146,6 +147,9 @@ from ._ops import (
     bitwise_or,
     bitwise_xor,
     bmm,
+    broadcast_shapes,
+    broadcast_tensors,
+    broadcast_to,
     cartesian_prod,
     cat,
     cdist,

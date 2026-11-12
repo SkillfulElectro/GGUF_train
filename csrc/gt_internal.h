@@ -24,6 +24,9 @@
 #include <omp.h>
 #endif
 
+// Queues the token of an external storage that has just been destroyed (see gt_external_released).
+void gt_external_note_released(uint64_t token);
+
 struct gt_storage {
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -34,6 +37,9 @@ struct gt_storage {
     int                   dtype = GT_F32;
     int                   device_type = GT_DEV_CPU;
     int                   device_index = 0;
+    // Non-zero when the bytes belong to somebody else (gt_tensor_from_external): the storage
+    // never frees them, and reports this token through gt_external_released() when it goes away.
+    uint64_t              external_token = 0;
 
     ~gt_storage() {
         if (buf) {
@@ -43,6 +49,10 @@ struct gt_storage {
         if (ctx) {
             ggml_free(ctx);
             ctx = nullptr;
+        }
+        if (external_token) {
+            gt_external_note_released(external_token);
+            external_token = 0;
         }
     }
 };
@@ -202,6 +212,21 @@ inline bool gt_check_contiguous(const gt_tensor * t) {
     return true;
 }
 
+// gt_check_contiguous() looks at the strides only. A slice such as x[1:] or
+// weight.chunk(3)[1] is "contiguous" and still starts in the middle of its storage, so code
+// that hands a tensor to ggml in place has to ask the stricter question below.
+//
+// True when ggml may use the elements of `t` where they are: densely packed in row-major
+// order, and starting at an address the backend can work with. On the CPU backend any
+// element of a host buffer is a valid start (ggml's own views are interior pointers too).
+// Device backends locate a tensor by its position inside the buffer and may require that
+// position to be aligned, so there only a tensor that starts its storage qualifies; anything
+// else must be materialised first (gt_tensor_contiguous copies when the offset is not 0).
+inline bool gt_ggml_inplace_ok(const gt_tensor * t) {
+    if (!t || !gt_check_contiguous(t)) return false;
+    return t->offset == 0 || t->device_type == GT_DEV_CPU;
+}
+
 inline int64_t gt_linear_to_elem_offset(const gt_tensor * t, int64_t linear_idx) {
     if (t->ndim == 0) return t->offset;
     int64_t off = t->offset;
@@ -325,8 +350,12 @@ struct gt_contig_owner {
     }
 };
 
-// Helper to run a small ggml compute graph on the tensor's backend
-// Note: out_gt must already be allocated; out_node is either bound to out_gt's buffer directly or copied.
+// Helper to run a small ggml compute graph on the tensor's backend.
+// out_gt must already be allocated. The result is computed straight into it when out_node is
+// a fresh node and out_gt is plain storage (contiguous, offset 0); otherwise it is copied,
+// honouring the offset and strides of out_gt, and a non-contiguous out_node is made
+// contiguous first. Returns false, without touching out_gt, when out_node's type or size
+// is not what out_gt holds - callers then take their general path.
 bool gt_exec_ggml_graph(
     gt_backend_entry * be,
     struct ggml_context * ctx,
@@ -334,7 +363,9 @@ bool gt_exec_ggml_graph(
     struct ggml_tensor * out_node,
     gt_tensor * out_gt);
 
-// Helper to wrap a contiguous gt_tensor (up to 4D, ggml-supported dtype) into a leaf ggml_tensor
+// Helper to wrap a gt_tensor (up to 4D, ggml-supported dtype) into a leaf ggml_tensor without
+// copying. The caller must have checked gt_ggml_inplace_ok(t): the leaf starts at the tensor's
+// offset inside its storage and assumes densely packed elements.
 struct ggml_tensor * gt_wrap_ggml_4d(
     struct ggml_context * ctx,
     const gt_tensor * t,

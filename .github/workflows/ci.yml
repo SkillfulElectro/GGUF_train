@@ -42,9 +42,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
+      # Builds against the llama.cpp revision pinned in build_native.py.
       - name: Build native libraries (ggml + llama.cpp bridge)
         run: |
-          python build_native.py -j 4 --refresh-llama
+          python build_native.py -j 4
         env:
           GGUF_TRAIN_BUILD_JOBS: "4"
 
@@ -52,9 +53,16 @@ jobs:
         run: |
           python -m pip install --no-build-isolation --no-deps --break-system-packages -e .
 
+      # NumPy is optional: this run is without it (the NumPy tests skip themselves) ...
       - name: Run test suite
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
+
+      # ... and this one with it, for from_numpy / Tensor.numpy / the array protocols.
+      - name: Run test suite with NumPy installed
+        run: |
+          python -m pip install numpy
+          python -m unittest discover -s tests -p "test_*.py"
 
       - name: Build wheel and sdist for install checks
         run: |

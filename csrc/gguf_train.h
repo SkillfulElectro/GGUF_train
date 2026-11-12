@@ -182,10 +182,20 @@ GT_API void        gt_cpu_features(char * buf, int buf_len);
 GT_API void        gt_backend_summary(char * buf, int buf_len);
 GT_API const char * gt_last_error(void);
 GT_API void        gt_clear_error(void);
+// Records msg as the calling thread's last error (for libraries layered on top, e.g. llama_bridge).
+GT_API void        gt_set_last_error(const char * msg);
 
 // Tensor lifecycle & metadata
 GT_API gt_tensor * gt_tensor_empty(int ndim, const int64_t * shape, int dtype, int device_type, int device_index);
 GT_API gt_tensor * gt_tensor_from_data(int ndim, const int64_t * shape, int dtype, int device_type, int device_index, const void * data, size_t nbytes);
+// A CPU tensor on memory owned by the caller - nothing is copied. `strides` count elements and
+// must not be negative; `data` points at the first element and must be aligned for the dtype.
+// The tensor (and every view of it) reads and writes those bytes until its storage is destroyed;
+// from then on `token` (any non-zero value chosen by the caller) is returned by
+// gt_external_released(), and only after that may the memory be freed or moved.
+GT_API gt_tensor * gt_tensor_from_external(int ndim, const int64_t * shape, const int64_t * strides, int dtype, void * data, uint64_t token);
+// Moves up to `capacity` tokens of destroyed external storages into `tokens`; returns how many.
+GT_API int64_t     gt_external_released(uint64_t * tokens, int64_t capacity);
 GT_API gt_tensor * gt_tensor_clone(const gt_tensor * t);
 GT_API gt_tensor * gt_tensor_view(const gt_tensor * t, int ndim, const int64_t * shape, const int64_t * strides, int64_t offset);
 GT_API gt_tensor * gt_tensor_contiguous(const gt_tensor * t);
@@ -204,6 +214,9 @@ GT_API int         gt_tensor_device_index(const gt_tensor * t);
 GT_API int         gt_tensor_is_contiguous(const gt_tensor * t);
 GT_API uint64_t    gt_tensor_data_ptr(const gt_tensor * t);
 GT_API uint64_t    gt_tensor_storage_ptr(const gt_tensor * t);
+// Host address of the first byte of the storage (0 unless the storage is host memory) and its size.
+GT_API uint64_t    gt_tensor_storage_host_ptr(const gt_tensor * t);
+GT_API size_t      gt_tensor_storage_nbytes(const gt_tensor * t);
 GT_API size_t      gt_tensor_nbytes(const gt_tensor * t);
 GT_API size_t      gt_tensor_elem_size(int dtype);
 
@@ -328,8 +341,25 @@ GT_API int gt_sgd_step(gt_tensor * param, const gt_tensor * grad, gt_tensor * mo
 GT_API gt_tensor * gt_fft_1d(const gt_tensor * a, int64_t n, int dim, int inverse, int real_input, int norm_mode);
 
 // GGUF & Quantization
+//
+// Tensors GGUF cannot describe directly (uint8, bool, complex, 0-d, more than
+// four dimensions, outer dimensions of size one, zero-sized dimensions) are
+// saved with their real shape and dtype in the metadata keys
+// "gguf_train.shape.<name>" (int64 array) and "gguf_train.dtype.<name>"
+// (string); gt_gguf_get_tensor applies them. Both prefixes are reserved.
+//
+// kv_types[i] is a gguf_type. Scalar values are passed as text in kv_vals[i].
+// For GGUF_TYPE_ARRAY entries kv_vals[i] is ignored and kv_arr_types[i] (element
+// gguf_type), kv_arr_n[i] (element count) and kv_arr_data[i] (packed elements,
+// one byte per bool, or a `const char * const *` for strings) describe the
+// array. copy_kv_from, when given, names a GGUF file whose metadata is copied
+// verbatim first; the entries passed here are applied on top of it.
 GT_API int         gt_gguf_save(const char * path, int n_tensors, const char ** names, const gt_tensor ** tensors,
                                 int n_kv, const char ** kv_keys, const int * kv_types, const char ** kv_vals);
+GT_API int         gt_gguf_save_ex(const char * path, int n_tensors, const char ** names, const gt_tensor ** tensors,
+                                   int n_kv, const char ** kv_keys, const int * kv_types, const char ** kv_vals,
+                                   const int * kv_arr_types, const int64_t * kv_arr_n, const void * const * kv_arr_data,
+                                   const char * copy_kv_from);
 GT_API gt_gguf_file * gt_gguf_open(const char * path);
 GT_API void        gt_gguf_close(gt_gguf_file * f);
 GT_API int64_t     gt_gguf_n_tensors(const gt_gguf_file * f);
@@ -338,7 +368,15 @@ GT_API gt_tensor * gt_gguf_get_tensor(const gt_gguf_file * f, const char * name,
 GT_API int64_t     gt_gguf_n_kv(const gt_gguf_file * f);
 GT_API const char * gt_gguf_kv_key(const gt_gguf_file * f, int64_t idx);
 GT_API int         gt_gguf_kv_type(const gt_gguf_file * f, int64_t idx);
+// Writes the value as text; returns its full length (as snprintf does), so a
+// result >= buf_len means it was cut short. A null buffer asks for the length.
 GT_API int         gt_gguf_kv_val_str(const gt_gguf_file * f, int64_t idx, char * buf, int buf_len);
+// Arrays: element gguf_type (-1 when the value is not an array), element count,
+// packed elements (null for string arrays), and the i-th string of a string array.
+GT_API int         gt_gguf_kv_arr_type(const gt_gguf_file * f, int64_t idx);
+GT_API int64_t     gt_gguf_kv_arr_n(const gt_gguf_file * f, int64_t idx);
+GT_API const void * gt_gguf_kv_arr_data(const gt_gguf_file * f, int64_t idx);
+GT_API const char * gt_gguf_kv_arr_str(const gt_gguf_file * f, int64_t idx, int64_t i);
 
 GT_API gt_tensor * gt_quantize(const gt_tensor * t, int ggml_type_id);
 GT_API gt_tensor * gt_dequantize(const gt_tensor * t, int out_dtype);

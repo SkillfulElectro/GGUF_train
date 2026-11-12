@@ -80,7 +80,25 @@ class MultiheadAttention(Module):
     ):
         is_batched = query.ndim == 3
         if not is_batched:
-            query, key, value = query.unsqueeze(1), key.unsqueeze(1), value.unsqueeze(1)
+            if query.ndim != 2 or key.ndim != 2 or value.ndim != 2:
+                raise RuntimeError(
+                    "MultiheadAttention: query, key and value must all be 3-D (batched) or all 2-D (unbatched), "
+                    f"got {query.ndim}-D, {key.ndim}-D and {value.ndim}-D"
+                )
+            # (L, E) has no batch dimension; add one where this layout keeps it
+            batch_dim = 0 if self.batch_first else 1
+            query, key, value = query.unsqueeze(batch_dim), key.unsqueeze(batch_dim), value.unsqueeze(batch_dim)
+            if key_padding_mask is not None:
+                if key_padding_mask.ndim != 1:
+                    raise RuntimeError(
+                        f"MultiheadAttention: key_padding_mask of an unbatched input must be 1-D (S), got {list(key_padding_mask.shape)}"
+                    )
+                key_padding_mask = key_padding_mask.unsqueeze(0)
+        elif key.ndim != 3 or value.ndim != 3:
+            raise RuntimeError(
+                "MultiheadAttention: query, key and value must all be 3-D (batched) or all 2-D (unbatched), "
+                f"got {query.ndim}-D, {key.ndim}-D and {value.ndim}-D"
+            )
         if not self.batch_first:
             query = query.transpose(0, 1)
             key = key.transpose(0, 1)
@@ -103,10 +121,27 @@ class MultiheadAttention(Module):
         k = F.linear(key, wk, bk).reshape((B, S, self.num_heads, self.head_dim)).transpose(1, 2)
         v = F.linear(value, wv, bv).reshape((B, S, self.num_heads, self.head_dim)).transpose(1, 2)
 
-        mask = attn_mask
+        # One additive float mask, broadcastable to the scores (B, H, L, S).
+        mask = None
+        if attn_mask is not None:
+            if attn_mask.ndim == 2:
+                if tuple(attn_mask.shape) != (L, S):
+                    raise RuntimeError(f"MultiheadAttention: the 2D attn_mask has shape {list(attn_mask.shape)}, expected {[L, S]}")
+                mask = self._additive_mask(attn_mask, q.dtype, "attn_mask").reshape((1, 1, L, S))
+            elif attn_mask.ndim == 3:
+                if tuple(attn_mask.shape) != (B * self.num_heads, L, S):
+                    raise RuntimeError(
+                        f"MultiheadAttention: the 3D attn_mask has shape {list(attn_mask.shape)}, expected {[B * self.num_heads, L, S]}"
+                    )
+                mask = self._additive_mask(attn_mask, q.dtype, "attn_mask").reshape((B, self.num_heads, L, S))
+            else:
+                raise RuntimeError(f"MultiheadAttention: attn_mask must be 2D or 3D, got {attn_mask.ndim}D")
         if key_padding_mask is not None:
-            # key_padding_mask: (B, S), True means ignore
-            km = key_padding_mask.unsqueeze(1).unsqueeze(2).to(q.dtype) * (-1e9)
+            if tuple(key_padding_mask.shape) != (B, S):
+                raise RuntimeError(
+                    f"MultiheadAttention: key_padding_mask has shape {list(key_padding_mask.shape)}, expected {[B, S]}"
+                )
+            km = self._additive_mask(key_padding_mask, q.dtype, "key_padding_mask").reshape((B, 1, 1, S))
             mask = km if mask is None else (mask + km)
 
         scale = 1.0 / math.sqrt(self.head_dim)
@@ -122,10 +157,7 @@ class MultiheadAttention(Module):
                 cm = ones((L, S), dtype=q.dtype, device=q.device).triu(diagonal=1) * (-1e9)
                 scores = scores + cm
             if mask is not None:
-                if mask.dtype == _dt.bool:
-                    scores = scores.masked_fill(~mask, -1e9)
-                else:
-                    scores = scores + mask
+                scores = scores + mask
             attn_weights = F.softmax(scores, dim=-1)
             if self.dropout > 0.0 and self.training:
                 attn_weights = F.dropout(attn_weights, p=self.dropout, training=True)
@@ -140,7 +172,23 @@ class MultiheadAttention(Module):
             out = out.transpose(0, 1)
         if not is_batched:
             out = out.squeeze(1 if not self.batch_first else 0)
+            if attn_weights is not None:
+                attn_weights = attn_weights.squeeze(0)
         return out, attn_weights
+
+    @staticmethod
+    def _additive_mask(mask: Tensor, dtype, name: str) -> Tensor:
+        """A mask as something to add to the attention scores.
+
+        torch.nn convention: in a boolean attn_mask or key_padding_mask, True marks a position
+        that must NOT be attended to (the opposite of F.scaled_dot_product_attention). A float
+        mask is added as it is.
+        """
+        if mask.dtype == _dt.bool:
+            return zeros(mask.shape, dtype=dtype, device=mask.device).masked_fill(mask, -1e9)
+        if not mask.is_floating_point():
+            raise RuntimeError(f"MultiheadAttention: {name} must be a boolean or floating point tensor, got {mask.dtype}")
+        return mask if mask.dtype == dtype else mask.to(dtype)
 
 
 class TransformerEncoderLayer(Module):

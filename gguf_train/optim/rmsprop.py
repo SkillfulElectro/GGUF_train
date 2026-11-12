@@ -14,7 +14,7 @@ class RMSprop(Optimizer):
         super().__init__(params, dict(lr=float(lr), alpha=float(alpha), eps=float(eps), weight_decay=float(weight_decay), momentum=float(momentum), centered=bool(centered)))
 
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = self._evaluate(closure)
         with _autograd_state.no_grad():
             for group in self.param_groups:
                 lr, alpha, eps, wd, mom, centered = group["lr"], group["alpha"], group["eps"], group["weight_decay"], group["momentum"], group["centered"]
@@ -53,7 +53,7 @@ class Adagrad(Optimizer):
         super().__init__(params, dict(lr=float(lr), lr_decay=float(lr_decay), weight_decay=float(weight_decay), eps=float(eps)))
 
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = self._evaluate(closure)
         with _autograd_state.no_grad():
             for group in self.param_groups:
                 for p in group["params"]:
@@ -78,7 +78,7 @@ class Adadelta(Optimizer):
         super().__init__(params, dict(lr=float(lr), rho=float(rho), eps=float(eps), weight_decay=float(weight_decay)))
 
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = self._evaluate(closure)
         with _autograd_state.no_grad():
             for group in self.param_groups:
                 rho, eps, lr, wd = group["rho"], group["eps"], group["lr"], group["weight_decay"]
@@ -104,7 +104,7 @@ class Adamax(Optimizer):
         super().__init__(params, dict(lr=float(lr), betas=betas, eps=float(eps), weight_decay=float(weight_decay)))
 
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = self._evaluate(closure)
         with _autograd_state.no_grad():
             for group in self.param_groups:
                 b1, b2 = group["betas"]
@@ -130,7 +130,7 @@ class NAdam(Optimizer):
         super().__init__(params, dict(lr=float(lr), betas=betas, eps=float(eps), weight_decay=float(weight_decay)))
 
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = self._evaluate(closure)
         with _autograd_state.no_grad():
             for group in self.param_groups:
                 b1, b2 = group["betas"]
@@ -159,7 +159,7 @@ class RAdam(Optimizer):
         super().__init__(params, dict(lr=float(lr), betas=betas, eps=float(eps), weight_decay=float(weight_decay)))
 
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = self._evaluate(closure)
         with _autograd_state.no_grad():
             for group in self.param_groups:
                 b1, b2 = group["betas"]
