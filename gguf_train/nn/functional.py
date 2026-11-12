@@ -73,19 +73,15 @@ def relu_(input: Tensor) -> Tensor:
 
 
 def relu6(input: Tensor, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_RELU6)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_RELU6))
+    return UnarySimpleFn.apply(input, _C.UNARY_RELU6)
 
 
 def leaky_relu(input: Tensor, negative_slope: float = 0.01, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_LEAKY_RELU, float(negative_slope))
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_LEAKY_RELU, float(negative_slope)))
+    return UnarySimpleFn.apply(input, _C.UNARY_LEAKY_RELU, float(negative_slope))
 
 
 def leaky_relu_(input: Tensor, negative_slope: float = 0.01) -> Tensor:
@@ -93,27 +89,21 @@ def leaky_relu_(input: Tensor, negative_slope: float = 0.01) -> Tensor:
 
 
 def elu(input: Tensor, alpha: float = 1.0, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_ELU, float(alpha))
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_ELU, float(alpha)))
+    return UnarySimpleFn.apply(input, _C.UNARY_ELU, float(alpha))
 
 
 def celu(input: Tensor, alpha: float = 1.0, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_CELU, float(alpha))
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_CELU, float(alpha)))
+    return UnarySimpleFn.apply(input, _C.UNARY_CELU, float(alpha))
 
 
 def selu(input: Tensor, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_SELU)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_SELU))
+    return UnarySimpleFn.apply(input, _C.UNARY_SELU)
 
 
 @_autocast_op(_AUTOCAST_LOWER)
@@ -140,46 +130,36 @@ def gelu(input: Tensor, approximate: str = "none") -> Tensor:
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_SILU)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_SILU))
+    return UnarySimpleFn.apply(input, _C.UNARY_SILU)
 
 
 swish = silu
 
 
 def mish(input: Tensor, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_MISH)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_MISH))
+    return UnarySimpleFn.apply(input, _C.UNARY_MISH)
 
 
 def hardswish(input: Tensor, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_HARDSWISH)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_HARDSWISH))
+    return UnarySimpleFn.apply(input, _C.UNARY_HARDSWISH)
 
 
 def hardsigmoid(input: Tensor, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_HARDSIGMOID)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_HARDSIGMOID))
+    return UnarySimpleFn.apply(input, _C.UNARY_HARDSIGMOID)
 
 
 def hardtanh(input: Tensor, min_val: float = -1.0, max_val: float = 1.0, inplace: bool = False) -> Tensor:
-    res = UnarySimpleFn.apply(input, _C.UNARY_HARDTANH, float(min_val), float(max_val))
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: UnarySimpleFn.apply(t, _C.UNARY_HARDTANH, float(min_val), float(max_val)))
+    return UnarySimpleFn.apply(input, _C.UNARY_HARDTANH, float(min_val), float(max_val))
 
 
 def sigmoid(input: Tensor) -> Tensor:
@@ -219,11 +199,9 @@ def hardshrink(input: Tensor, lambd: float = 0.5) -> Tensor:
 
 
 def threshold(input: Tensor, threshold: float, value: float, inplace: bool = False) -> Tensor:
-    res = where(input > threshold, input, zeros_like(input) + value)
     if inplace:
-        input.copy_(res)
-        return input
-    return res
+        return input._apply_inplace(lambda t: where(t > threshold, t, zeros_like(t) + value))
+    return where(input > threshold, input, zeros_like(input) + value)
 
 
 def softmax(input: Tensor, dim: int | None = None, _stacklevel: int = 3, dtype=None) -> Tensor:
@@ -282,19 +260,15 @@ def dropout(input: Tensor, p: float = 0.5, training: bool = True, inplace: bool 
     if not training or p == 0.0:
         return input
     if p == 1.0:
-        out = zeros_like(input)
         if inplace:
-            input.copy_(out)
-            return input
-        return out
+            return input._apply_inplace(lambda t: zeros_like(t))
+        return zeros_like(input)
     from .._creation import rand_like
     keep = 1.0 - float(p)
     mask = (rand_like(input) < keep).to(input.dtype) / keep
-    out = input * mask
     if inplace:
-        input.copy_(out)
-        return input
-    return out
+        return input._apply_inplace(lambda t: t * mask)
+    return input * mask
 
 
 def dropout1d(input: Tensor, p: float = 0.5, training: bool = True, inplace: bool = False) -> Tensor:
@@ -308,11 +282,9 @@ def dropout2d(input: Tensor, p: float = 0.5, training: bool = True, inplace: boo
     keep = 1.0 - float(p)
     m_sh = (input.shape[0], input.shape[1]) + (1,) * (input.ndim - 2)
     mask = (rand(m_sh, dtype=input.dtype, device=input.device) < keep).to(input.dtype) / keep
-    out = input * mask
     if inplace:
-        input.copy_(out)
-        return input
-    return out
+        return input._apply_inplace(lambda t: t * mask)
+    return input * mask
 
 
 def dropout3d(input: Tensor, p: float = 0.5, training: bool = True, inplace: bool = False) -> Tensor:

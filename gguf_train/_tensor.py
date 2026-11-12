@@ -12,11 +12,13 @@ import operator
 import struct
 import sys
 import warnings
+import weakref
 
 from . import _C, _autograd_state, _device as _dev, _dtype as _dt
 from .amp import _active as _autocast_active, _suspended as _autocast_suspended
 from ._autograd_engine import backward as _autograd_backward
 from ._functions import (
+    SetItemFn,
     AddFn,
     AddmmFn,
     Atan2Fn,
@@ -1586,7 +1588,11 @@ class Tensor:
     def __setitem__(self, idx, value):
         # Writes into the tensor's storage: refused for a leaf that requires grad (as every
         # other in-place operation is), and the version counter moves on.
-        self._check_inplace()
+        if self._check_inplace(value):
+            # recorded: the tensor becomes "itself with these elements replaced"
+            val_t = _ensure_tensor(value, self)
+            self._record_inplace(lambda old: SetItemFn.apply(old, val_t, idx))
+            return
         idx = _normalize_index(idx, self.device)
         val_t = _ensure_tensor(value, self)
         if val_t.dtype != self.dtype:
@@ -2042,14 +2048,91 @@ class Tensor:
 
     # ---------- In-place Mutations ----------
 
-    def _check_inplace(self):
-        if _autograd_state.is_grad_enabled() and self.requires_grad and self._is_leaf:
-            raise RuntimeError("a leaf Variable that requires grad is being used in an in-place operation.")
+    # An in-place operation writes into the storage of the tensor, which every view of it
+    # shares. When autograd is recording and the tensor or an operand requires grad, it is
+    # also an operation of the graph: the tensor object goes on as the *result*, and what it
+    # was before lives on in a copy that takes over its history (_record_inplace). Earlier
+    # uses of the tensor keep pointing at that history - graph edges remember the node, not
+    # just the tensor.
+    #
+    # Two things PyTorch does are not done here. The history of other tensors on the same
+    # storage (the base of a view, views of the tensor) is not rewritten: after `v = x[0];
+    # v.mul_(2)` the gradient of a later use of `x` does not know about the factor (`x[0] *= 2`
+    # is fine: it ends in an assignment to `x`). And there is no check that an operation
+    # recorded earlier still finds the values it needs for its gradient: PyTorch raises
+    # "modified by an inplace operation" for torch.exp(x).mul_(2); here the result is silently
+    # wrong, as it is for every program PyTorch rejects with that error.
+
+    def _check_inplace(self, *operands) -> bool:
+        """Called first by every in-place operation. Refuses it on a leaf that requires grad;
+        returns True when the operation has to be recorded (the caller then goes through
+        _record_inplace) and False when it only changes data."""
+        state = _autograd_state._state()
+        if state.recorder is not None:
+            state.recorder.check_inplace(self)
+        if state.grad_enabled and not state.inference_mode:
+            if self._requires_grad:
+                if self._is_leaf:
+                    raise RuntimeError("a leaf Variable that requires grad is being used in an in-place operation.")
+                return True
+            if self.dtype.is_floating_point or self.dtype.is_complex:
+                for other in operands:
+                    if isinstance(other, Tensor) and other._requires_grad:
+                        return True
         self._version += 1
+        return False
+
+    def _record_inplace(self, compute) -> Tensor:
+        """Carry out an in-place operation that autograd records. ``compute(old)`` is the
+        operation in its ordinary form, applied to `old`: a tensor holding the present value
+        of this one, with its history. This tensor then takes the value and the history of the
+        result. ``compute`` may return None after changing nothing: the caller fills the
+        tensor itself and it becomes a constant."""
+        old = self.detach().clone()
+        old._requires_grad = self._requires_grad
+        old._grad_fn = self._grad_fn
+        old._output_nr = self._output_nr
+        old._is_leaf = self._is_leaf
+        # hooks were registered for the value the tensor had; they stay with it
+        old._hooks, self._hooks = self._hooks, {}
+        old._next_hook_id = self._next_hook_id
+        if self._grad_fn is not None:
+            self._grad_fn.output_refs[self._output_nr] = weakref.ref(old)
+        res = compute(old)
+        self._version += 1
+        if res is None:
+            self._requires_grad = False
+            self._grad_fn = None
+            self._is_leaf = True
+            return self
+        if res.shape != self.shape:
+            raise RuntimeError(f"output with shape {list(self.shape)} doesn't match the broadcast shape {list(res.shape)}")
+        if res.dtype != self.dtype:
+            res = res.to(self.dtype)
+        _C.check_rc(_C.lib.gt_tensor_copy_inplace(self._ptr, res._ptr), "in-place operation")
+        self._requires_grad = res._requires_grad
+        self._grad_fn = res._grad_fn
+        self._output_nr = res._output_nr
+        self._is_leaf = res._grad_fn is None
+        if res._grad_fn is not None:
+            res._grad_fn.output_refs[res._output_nr] = weakref.ref(self)
+        return self
+
+    def _apply_inplace(self, fn) -> Tensor:
+        """Overwrite this tensor with ``fn(self)`` - the ``inplace=True`` of nn.functional."""
+        if self._check_inplace():
+            return self._record_inplace(fn)
+        res = fn(self)
+        if res.dtype != self.dtype:
+            res = res.to(self.dtype)
+        _C.check_rc(_C.lib.gt_tensor_copy_inplace(self._ptr, res._ptr), "in-place operation")
+        return self
 
     def copy_(self, src: Tensor, non_blocking: bool = False) -> Tensor:
         (non_blocking,)
-        self._check_inplace()
+        if self._check_inplace(src):
+            # the old value does not enter the result: the history of `src` replaces it
+            return self._record_inplace(lambda old: _ensure_tensor(src, self).expand(self.shape).to(self.dtype))
         s = _ensure_tensor(src, self)
         if s.shape != self.shape:
             s = s.expand(self.shape)
@@ -2057,7 +2140,10 @@ class Tensor:
         return self
 
     def fill_(self, value) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(value):
+            if isinstance(value, Tensor) and value._requires_grad:
+                return self._record_inplace(lambda old: value.expand(self.shape).to(self.dtype))
+            self._record_inplace(lambda old: None)      # a constant from here on
         value = _unwrap_numpy_scalar(value)
         if isinstance(value, (int, bool)) and not self.dtype.is_floating_point:
             _C.check_rc(_C.lib.gt_fill_scalar_i64(self._ptr, int(value)), "fill_")
@@ -2069,22 +2155,26 @@ class Tensor:
         return self.fill_(0)
 
     def uniform_(self, from_: float = 0.0, to: float = 1.0) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            self._record_inplace(lambda old: None)      # a constant from here on
         _C.check_rc(_C.lib.gt_fill_uniform(self._ptr, float(from_), float(to)), "uniform_")
         return self
 
     def normal_(self, mean: float = 0.0, std: float = 1.0) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            self._record_inplace(lambda old: None)      # a constant from here on
         _C.check_rc(_C.lib.gt_fill_normal(self._ptr, float(mean), float(std)), "normal_")
         return self
 
     def trunc_normal_(self, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            self._record_inplace(lambda old: None)      # a constant from here on
         _C.check_rc(_C.lib.gt_fill_trunc_normal(self._ptr, float(mean), float(std), float(a), float(b)), "trunc_normal_")
         return self
 
     def bernoulli_(self, p: float = 0.5) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            self._record_inplace(lambda old: None)      # a constant from here on
         _C.check_rc(_C.lib.gt_fill_bernoulli_prob(self._ptr, float(p)), "bernoulli_")
         return self
 
@@ -2095,7 +2185,8 @@ class Tensor:
         return _wrap(_C.lib.gt_multinomial(self._ptr, int(num_samples), 1 if replacement else 0), "multinomial")
 
     def add_(self, other, *, alpha: float = 1.0) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(other):
+            return self._record_inplace(lambda old: old.add(other, alpha=alpha))
         if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_ADD, float(alpha)), "add_")
         else:
@@ -2103,7 +2194,8 @@ class Tensor:
         return self
 
     def sub_(self, other, *, alpha: float = 1.0) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(other):
+            return self._record_inplace(lambda old: old.sub(other, alpha=alpha))
         if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_SUB, float(alpha)), "sub_")
         else:
@@ -2111,7 +2203,8 @@ class Tensor:
         return self
 
     def mul_(self, other) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(other):
+            return self._record_inplace(lambda old: old.mul(other))
         if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_MUL, 1.0), "mul_")
         else:
@@ -2119,7 +2212,8 @@ class Tensor:
         return self
 
     def div_(self, other) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(other):
+            return self._record_inplace(lambda old: old.div(other))
         if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_DIV, 1.0), "div_")
         else:
@@ -2139,7 +2233,8 @@ class Tensor:
         return self.div_(other)
 
     def clamp_(self, min=None, max=None) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(min, max):
+            return self._record_inplace(lambda old: old.clamp(min=min, max=max))
         a = float(min) if min is not None else float("nan")
         b = float(max) if max is not None else float("nan")
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_CLAMP, a, b), "clamp_")
@@ -2149,47 +2244,56 @@ class Tensor:
         return self.clamp_(min=min, max=max)
 
     def relu_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.relu())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_RELU, 0.0, 0.0), "relu_")
         return self
 
     def sigmoid_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.sigmoid())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_SIGMOID, 0.0, 0.0), "sigmoid_")
         return self
 
     def tanh_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.tanh())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_TANH, 0.0, 0.0), "tanh_")
         return self
 
     def neg_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.neg())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_NEG, 0.0, 0.0), "neg_")
         return self
 
     def abs_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.abs())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_ABS, 0.0, 0.0), "abs_")
         return self
 
     def sqrt_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.sqrt())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_SQRT, 0.0, 0.0), "sqrt_")
         return self
 
     def exp_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.exp())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_EXP, 0.0, 0.0), "exp_")
         return self
 
     def log_(self) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace():
+            return self._record_inplace(lambda old: old.log())
         _C.check_rc(_C.lib.gt_unary_inplace(self._ptr, _C.UNARY_LOG, 0.0, 0.0), "log_")
         return self
 
     def masked_fill_(self, mask: Tensor, value: float) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(value):
+            return self._record_inplace(lambda old: old.masked_fill(mask, value))
         _C.check_rc(_C.lib.gt_masked_fill_inplace(self._ptr, mask._ptr, float(value)), "masked_fill_")
         return self
 
@@ -2202,13 +2306,15 @@ class Tensor:
         return MaskedSelectFn.apply(self, mask)
 
     def scatter_(self, dim: int, index: Tensor, src) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(src):
+            return self._record_inplace(lambda old: old.scatter(dim, index, src))
         src_t = _ensure_tensor(src, self)
         _C.check_rc(_C.lib.gt_scatter_inplace(self._ptr, dim if dim >= 0 else dim + self.ndim, index._ptr, src_t._ptr, 0), "scatter_")
         return self
 
     def scatter_add_(self, dim: int, index: Tensor, src: Tensor) -> Tensor:
-        self._check_inplace()
+        if self._check_inplace(src):
+            return self._record_inplace(lambda old: old.scatter_add(dim, index, src))
         _C.check_rc(_C.lib.gt_scatter_inplace(self._ptr, dim if dim >= 0 else dim + self.ndim, index._ptr, src._ptr, 1), "scatter_add_")
         return self
 

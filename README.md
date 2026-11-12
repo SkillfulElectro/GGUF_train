@@ -81,7 +81,8 @@ For a compatible GGUF language model, `torch.llama.LlamaModel(path)` provides to
 
 - **NumPy.** `torch.from_numpy`, `torch.as_tensor` and `Tensor.numpy()` share memory with the array (no copy) for CPU tensors of a matching dtype; NumPy functions applied to tensors (`np.exp(t)`, `t + np.float32(2)`) run as tensor operations and keep autograd. NumPy is optional.
 - **Autocast.** `torch.autocast` follows one policy for every device type, PyTorch's CUDA lists: matrix products, convolutions and linear layers run in the autocast dtype; `exp`, `log`, `pow`, losses, normalization layers, `softmax` and reductions run in float32; the rest follows its inputs. The table is in the docstring of `gguf_train/amp.py`.
-- **`torch.utils.checkpoint`.** The checkpointed function may reach its tensors any way it likes (arguments, module parameters, closures, globals); it must not change its inputs in place, and a tensor it stores somewhere other than its return value carries no gradient. Random numbers and the autocast state of the forward pass are replayed when it is recomputed.
+- **In-place operations** (`x += y`, `x.mul_(w)`, `x[i] = v`, `nn.ReLU(inplace=True)`) are part of the autograd graph. Two things PyTorch does are not done: after an in-place operation on a *view* (`v = x[0]; v.mul_(2)`), a later use of `x` is differentiated without it (`x[0] *= 2` is fine), and there is no "modified by an inplace operation" error when an earlier operation still needed the overwritten values.
+- **`torch.utils.checkpoint`.** The checkpointed function may reach its tensors any way it likes (arguments, module parameters, closures, globals); it must not change a tensor from outside in place, and a tensor it stores somewhere other than its return value carries no gradient. Random numbers and the autocast state of the forward pass are replayed when it is recomputed.
 
 ## Limitations
 

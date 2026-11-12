@@ -321,6 +321,28 @@ class CatFn(Function):
 # ==================== Unary Functions ====================
 
 
+class SetItemFn(Function):
+    """``base[idx] = value`` as an operation with a result: a copy of `base` with the selected
+    elements replaced. The gradient of the replaced elements goes to `value`, the rest to `base`."""
+
+    @staticmethod
+    def forward(ctx: Context, base, value, idx):
+        ctx.idx = idx
+        ctx.value_shape = tuple(value.shape)
+        out = base.clone()
+        out[idx] = value
+        return out
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        if grad_out is None:
+            return None, None, None
+        g_base = grad_out.clone()
+        g_base[ctx.idx] = 0.0
+        g_value = _unbroadcast(grad_out[ctx.idx], ctx.value_shape)
+        return g_base, g_value, None
+
+
 class UnarySimpleFn(Function):
     """Differentiable unary ops dispatching via gt_unary_op."""
 
