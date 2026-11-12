@@ -96,7 +96,7 @@ static int gt_unary_out_dtype(int in_dtype, int op_id) {
 static bool gt_try_ggml_unary(const gt_tensor * a, gt_tensor * out, int op_id, double p1, double p2) {
     if (a->dtype != GT_F32 || out->dtype != GT_F32) return false;
     if (a->device_type == GT_DEV_META || a->numel == 0) return false;
-    if (!gt_check_contiguous(a) || !gt_check_contiguous(out)) return false;
+    if (!gt_ggml_inplace_ok(a) || !gt_ggml_inplace_ok(out)) return false;
     if (a->device_type != out->device_type || a->device_index != out->device_index) return false;
 
     // Check if ggml supports this exact unary op
@@ -115,7 +115,8 @@ static bool gt_try_ggml_unary(const gt_tensor * a, gt_tensor * out, int op_id, d
         case GT_UNARY_TANH:
         case GT_UNARY_FLOOR:
         case GT_UNARY_CEIL:
-        case GT_UNARY_ROUND:
+        // not GT_UNARY_ROUND: ggml rounds halves away from zero (roundf), torch.round rounds them
+        // to even - which is what the scalar path does, for every dtype and layout
         case GT_UNARY_TRUNC:
         case GT_UNARY_RELU:
         case GT_UNARY_SIGMOID:
@@ -126,9 +127,12 @@ static bool gt_try_ggml_unary(const gt_tensor * a, gt_tensor * out, int op_id, d
         case GT_UNARY_HARDSWISH:
         case GT_UNARY_HARDSIGMOID:
         case GT_UNARY_LEAKY_RELU:
-        case GT_UNARY_CLAMP:
             supported = true;
             break;
+        // GT_UNARY_CLAMP is deliberately absent. ggml_clamp computes MAX(MIN(x, max), min)
+        // with plain C comparisons: an absent bound (passed as NaN) turned clamp(min=m) into
+        // the constant m and clamp(max=M) into NaN, and a NaN element came out as `max`
+        // instead of staying NaN. The general loop in gt_unary_op has the torch semantics.
         case GT_UNARY_ELU:
             supported = (std::abs(p1 - 1.0) < 1e-6);
             break;
@@ -178,7 +182,6 @@ static bool gt_try_ggml_unary(const gt_tensor * a, gt_tensor * out, int op_id, d
         case GT_UNARY_ELU:         gout = ggml_elu(ctx, ga); break;
         case GT_UNARY_FLOOR:       gout = ggml_floor(ctx, ga); break;
         case GT_UNARY_CEIL:        gout = ggml_ceil(ctx, ga); break;
-        case GT_UNARY_ROUND:       gout = ggml_round(ctx, ga); break;
         case GT_UNARY_TRUNC:       gout = ggml_trunc(ctx, ga); break;
         case GT_UNARY_RELU:        gout = ggml_relu(ctx, ga); break;
         case GT_UNARY_SIGMOID:     gout = ggml_sigmoid(ctx, ga); break;
@@ -190,7 +193,6 @@ static bool gt_try_ggml_unary(const gt_tensor * a, gt_tensor * out, int op_id, d
         case GT_UNARY_HARDSWISH:   gout = ggml_hardswish(ctx, ga); break;
         case GT_UNARY_HARDSIGMOID: gout = ggml_hardsigmoid(ctx, ga); break;
         case GT_UNARY_LEAKY_RELU:  gout = ggml_leaky_relu(ctx, ga, (float)p1, false); break;
-        case GT_UNARY_CLAMP:       gout = ggml_clamp(ctx, ga, (float)p1, (float)p2); break;
         default: break;
     }
     if (!gout) {
@@ -464,7 +466,8 @@ static bool gt_is_cmp_or_logic(int op_id) {
 static int gt_binary_out_dtype(int da, int db, int op_id) {
     if (gt_is_cmp_or_logic(op_id)) return GT_BOOL;
     int p = gt_promote_dtype(da, db);
-    if ((op_id == GT_BIN_DIV) && (gt_is_integer(p) || p == GT_BOOL)) {
+    // true division and atan2 of integers are not integers
+    if ((op_id == GT_BIN_DIV || op_id == GT_BIN_ATAN2) && (gt_is_integer(p) || p == GT_BOOL)) {
         return GT_F32;
     }
     return p;
@@ -474,7 +477,7 @@ static bool gt_try_ggml_binary(const gt_tensor * a, const gt_tensor * b, gt_tens
     if (a->dtype != GT_F32 || b->dtype != GT_F32 || out->dtype != GT_F32) return false;
     if (a->device_type == GT_DEV_META || out->numel == 0) return false;
     if (a->device_type != b->device_type || a->device_index != b->device_index) return false;
-    if (!gt_check_contiguous(a) || !gt_check_contiguous(b) || !gt_check_contiguous(out)) return false;
+    if (!gt_ggml_inplace_ok(a) || !gt_ggml_inplace_ok(b) || !gt_ggml_inplace_ok(out)) return false;
 
     if (op_id != GT_BIN_ADD && op_id != GT_BIN_SUB && op_id != GT_BIN_MUL && op_id != GT_BIN_DIV) {
         return false;
@@ -897,7 +900,7 @@ extern "C" gt_tensor * gt_reduce(const gt_tensor * a, int op_id, int n_axes, con
     // Fast ggml full-tensor sum/mean path for F32
     if (n_axes <= 0 && (op_id == GT_RED_SUM || op_id == GT_RED_MEAN) &&
         a->dtype == GT_F32 && dst_dtype == GT_F32 && a->numel > 0 &&
-        gt_check_contiguous(a) && a->device_type != GT_DEV_META && !keepdim && out_ndim == 0) {
+        gt_ggml_inplace_ok(a) && a->device_type != GT_DEV_META && !keepdim && out_ndim == 0) {
         gt_backend_entry * be = gt_get_backend(a->device_type, a->device_index);
         if (be) {
             gt_tensor * out = gt_tensor_empty(0, out_shape, dst_dtype, a->device_type, a->device_index);
@@ -923,7 +926,7 @@ extern "C" gt_tensor * gt_reduce(const gt_tensor * a, int op_id, int n_axes, con
     // Fast ggml last-dim sum/argmax path for F32 2D
     if (nd == 2 && n_axes == 1 && !reduce_axis[0] && reduce_axis[1] &&
         (op_id == GT_RED_SUM || op_id == GT_RED_ARGMAX) &&
-        a->dtype == GT_F32 && a->numel > 0 && gt_check_contiguous(a) && a->device_type != GT_DEV_META) {
+        a->dtype == GT_F32 && a->numel > 0 && gt_ggml_inplace_ok(a) && a->device_type != GT_DEV_META) {
         if ((op_id == GT_RED_SUM && dst_dtype == GT_F32) || (op_id == GT_RED_ARGMAX && dst_dtype == GT_I32)) {
             gt_backend_entry * be = gt_get_backend(a->device_type, a->device_index);
             if (be) {

@@ -13,6 +13,34 @@ from ..parameter import Parameter
 from .module import Module
 
 
+def _rnn_step(x: Tensor, h: Tensor, w_ih, w_hh, b_ih, b_hh, nonlinearity: str) -> Tensor:
+    pre = F.linear(x, w_ih, b_ih) + F.linear(h, w_hh, b_hh)
+    return pre.relu() if nonlinearity == "relu" else pre.tanh()
+
+
+def _lstm_step(x: Tensor, h: Tensor, c: Tensor, w_ih, w_hh, b_ih, b_hh):
+    gates = F.linear(x, w_ih, b_ih) + F.linear(h, w_hh, b_hh)
+    i, f, g, o = gates.chunk(4, dim=1)
+    i = i.sigmoid()
+    f = f.sigmoid()
+    g = g.tanh()
+    o = o.sigmoid()
+    cy = f * c + i * g
+    hy = o * cy.tanh()
+    return hy, cy
+
+
+def _gru_step(x: Tensor, h: Tensor, w_ih, w_hh, b_ih, b_hh) -> Tensor:
+    gi = F.linear(x, w_ih, b_ih)
+    gh = F.linear(h, w_hh, b_hh)
+    i_r, i_z, i_n = gi.chunk(3, dim=1)
+    h_r, h_z, h_n = gh.chunk(3, dim=1)
+    r = (i_r + h_r).sigmoid()
+    z = (i_z + h_z).sigmoid()
+    n = (i_n + r * h_n).tanh()
+    return n + z * (h - n)
+
+
 class RNNCell(Module):
     def __init__(self, input_size: int, hidden_size: int, bias: bool = True, nonlinearity: str = "tanh", device=None, dtype=None) -> None:
         super().__init__()
@@ -35,8 +63,7 @@ class RNNCell(Module):
     def forward(self, input: Tensor, hx: Tensor | None = None) -> Tensor:
         if hx is None:
             hx = zeros((input.shape[0], self.hidden_size), dtype=input.dtype, device=input.device)
-        pre = F.linear(input, self.weight_ih, self.bias_ih) + F.linear(hx, self.weight_hh, self.bias_hh)
-        return pre.relu() if self.nonlinearity == "relu" else pre.tanh()
+        return _rnn_step(input, hx, self.weight_ih, self.weight_hh, self.bias_ih, self.bias_hh, self.nonlinearity)
 
 
 class LSTMCell(Module):
@@ -63,15 +90,7 @@ class LSTMCell(Module):
             c0 = zeros((input.shape[0], self.hidden_size), dtype=input.dtype, device=input.device)
         else:
             h0, c0 = hx
-        gates = F.linear(input, self.weight_ih, self.bias_ih) + F.linear(h0, self.weight_hh, self.bias_hh)
-        i, f, g, o = gates.chunk(4, dim=1)
-        i = i.sigmoid()
-        f = f.sigmoid()
-        g = g.tanh()
-        o = o.sigmoid()
-        cy = f * c0 + i * g
-        hy = o * cy.tanh()
-        return hy, cy
+        return _lstm_step(input, h0, c0, self.weight_ih, self.weight_hh, self.bias_ih, self.bias_hh)
 
 
 class GRUCell(Module):
@@ -95,17 +114,19 @@ class GRUCell(Module):
     def forward(self, input: Tensor, hx: Tensor | None = None) -> Tensor:
         if hx is None:
             hx = zeros((input.shape[0], self.hidden_size), dtype=input.dtype, device=input.device)
-        gi = F.linear(input, self.weight_ih, self.bias_ih)
-        gh = F.linear(hx, self.weight_hh, self.bias_hh)
-        i_r, i_z, i_n = gi.chunk(3, dim=1)
-        h_r, h_z, h_n = gh.chunk(3, dim=1)
-        r = (i_r + h_r).sigmoid()
-        z = (i_z + h_z).sigmoid()
-        n = (i_n + r * h_n).tanh()
-        return n + z * (hx - n)
+        return _gru_step(input, hx, self.weight_ih, self.weight_hh, self.bias_ih, self.bias_hh)
 
 
 class _RNNBase(Module):
+    """Multi-layer RNN / LSTM / GRU.
+
+    The parameters carry the names torch.nn uses - weight_ih_l{k}, weight_hh_l{k}, bias_ih_l{k},
+    bias_hh_l{k}, with the suffix _reverse for the second direction - so a state_dict can be
+    exchanged with a torch.nn module of the same configuration.
+    """
+
+    _GATES = {"RNN": 1, "LSTM": 4, "GRU": 3}
+
     def __init__(
         self,
         mode: str,
@@ -129,21 +150,48 @@ class _RNNBase(Module):
         self.batch_first = bool(batch_first)
         self.dropout = float(dropout)
         self.bidirectional = bool(bidirectional)
+        self.nonlinearity = nonlinearity
         num_dirs = 2 if bidirectional else 1
+        gates = self._GATES[mode]
+        dt = dtype or _dt.get_default_dtype()
 
-        cell_cls = {"RNN": RNNCell, "LSTM": LSTMCell, "GRU": GRUCell}[mode]
-        self._cells = []
         for layer in range(self.num_layers):
             in_sz = self.input_size if layer == 0 else self.hidden_size * num_dirs
             for d in range(num_dirs):
-                kw = {"bias": bias, "device": device, "dtype": dtype}
-                if mode == "RNN":
-                    kw["nonlinearity"] = nonlinearity
-                c = cell_cls(in_sz, self.hidden_size, **kw)
-                suffix = "_reverse" if d == 1 else ""
-                name = f"cell_l{layer}{suffix}"
-                self.add_module(name, c)
-                self._cells.append((layer, d, c))
+                sfx = self._suffix(layer, d)
+                setattr(self, "weight_ih" + sfx, Parameter(empty((gates * self.hidden_size, in_sz), dtype=dt, device=device)))
+                setattr(self, "weight_hh" + sfx, Parameter(empty((gates * self.hidden_size, self.hidden_size), dtype=dt, device=device)))
+                if self.bias:
+                    setattr(self, "bias_ih" + sfx, Parameter(empty((gates * self.hidden_size,), dtype=dt, device=device)))
+                    setattr(self, "bias_hh" + sfx, Parameter(empty((gates * self.hidden_size,), dtype=dt, device=device)))
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for p in self.parameters():
+            init.uniform_(p, -stdv, stdv)
+
+    @staticmethod
+    def _suffix(layer: int, direction: int) -> str:
+        return f"_l{layer}" + ("_reverse" if direction == 1 else "")
+
+    def _weights(self, layer: int, direction: int):
+        sfx = self._suffix(layer, direction)
+        w_ih = getattr(self, "weight_ih" + sfx)
+        w_hh = getattr(self, "weight_hh" + sfx)
+        if not self.bias:
+            return w_ih, w_hh, None, None
+        return w_ih, w_hh, getattr(self, "bias_ih" + sfx), getattr(self, "bias_hh" + sfx)
+
+    def _legacy_state_dict_keys(self) -> dict:
+        # before the torch names: one cell module per layer and direction, "cell_l0.weight_ih"
+        keys = {}
+        for layer in range(self.num_layers):
+            for d in range(2 if self.bidirectional else 1):
+                sfx = self._suffix(layer, d)
+                for kind in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+                    keys[f"cell{sfx}.{kind}"] = kind + sfx
+        return keys
+
+    def flatten_parameters(self) -> None:
+        """Nothing to do; present because code written for torch.nn calls it."""
 
     def forward(self, input: Tensor, hx=None):
         x = input.transpose(0, 1) if self.batch_first else input
@@ -166,7 +214,7 @@ class _RNNBase(Module):
         for layer in range(self.num_layers):
             dir_outs = []
             for d in range(num_dirs):
-                cell = getattr(self, f"cell_l{layer}{'_reverse' if d == 1 else ''}")
+                w_ih, w_hh, b_ih, b_hh = self._weights(layer, d)
                 s_idx = layer * num_dirs + d
                 h_t = h0[s_idx]
                 c_t = c0[s_idx] if c0 is not None else None
@@ -174,9 +222,11 @@ class _RNNBase(Module):
                 ys = []
                 for t in steps:
                     if self.mode == "LSTM":
-                        h_t, c_t = cell(cur_seq[t], (h_t, c_t))
+                        h_t, c_t = _lstm_step(cur_seq[t], h_t, c_t, w_ih, w_hh, b_ih, b_hh)
+                    elif self.mode == "GRU":
+                        h_t = _gru_step(cur_seq[t], h_t, w_ih, w_hh, b_ih, b_hh)
                     else:
-                        h_t = cell(cur_seq[t], h_t)
+                        h_t = _rnn_step(cur_seq[t], h_t, w_ih, w_hh, b_ih, b_hh, self.nonlinearity)
                     ys.append(h_t)
                 if d == 1:
                     ys.reverse()

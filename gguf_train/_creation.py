@@ -8,7 +8,7 @@ import time
 
 from . import _C, _device as _dev, _dtype as _dt
 from ._functions import _c_i64_arr, _wrap
-from ._tensor import Tensor, _from_python
+from ._tensor import Tensor, _from_numpy_shared, _from_python, _is_int, _numpy, _unwrap_numpy_scalar
 
 _CURRENT_SEED = 0
 
@@ -25,7 +25,13 @@ def tensor(data, *, dtype=None, device=None, requires_grad: bool = False, pin_me
 
 
 def as_tensor(data, dtype=None, device=None) -> Tensor:
+    """`data` as a tensor without copying where that is possible: a tensor is returned as it is,
+    an ndarray shares its memory (see from_numpy) - unless `dtype` or `device` ask for something
+    else, which takes a copy."""
     dev = _dev.as_device(device)
+    np = _numpy()
+    if np is not None and isinstance(data, np.ndarray):
+        data = from_numpy(data)
     if isinstance(data, Tensor):
         out = data
         if dev is not None and out.device != dev:
@@ -39,7 +45,17 @@ def as_tensor(data, dtype=None, device=None) -> Tensor:
 
 
 def from_numpy(ndarray) -> Tensor:
-    return _from_python(ndarray)
+    """A tensor on the memory of a NumPy array: no copy, and a write through either one shows
+    in the other. The array is kept alive for as long as any tensor uses its memory.
+
+    TypeError for anything that is not an ndarray and for element types without a tensor
+    equivalent; arrays with negative strides, a foreign byte order or unaligned data are
+    refused as well (an error that is both TypeError and ValueError) - copy those first.
+    """
+    np = _numpy()
+    if np is None or not isinstance(ndarray, np.ndarray):
+        raise TypeError(f"expected np.ndarray (got {type(ndarray).__name__})")
+    return _from_numpy_shared(ndarray)
 
 
 def scalar_tensor(s, *, dtype=None, device=None, requires_grad: bool = False) -> Tensor:
@@ -107,7 +123,8 @@ def ones_like(input: Tensor, *, dtype=None, layout=None, device=None, requires_g
 
 
 def full(size, fill_value, *, out=None, dtype=None, layout=None, device=None, requires_grad: bool = False) -> Tensor:
-    sh = (size,) if isinstance(size, int) else tuple(size)
+    sh = (int(size),) if _is_int(size) else tuple(size)
+    fill_value = _unwrap_numpy_scalar(fill_value)  # np.float32(1.5) fills like 1.5
     if dtype is None:
         if isinstance(fill_value, bool):
             dt = _dt.bool
@@ -135,6 +152,8 @@ def full_like(input: Tensor, fill_value, *, dtype=None, layout=None, device=None
 
 
 def arange(start=0, end=None, step=1, *, out=None, dtype=None, layout=None, device=None, requires_grad: bool = False) -> Tensor:
+    # NumPy scalars count as the Python numbers they stand for (np.float32 is not a float)
+    start, end, step = _unwrap_numpy_scalar(start), _unwrap_numpy_scalar(end), _unwrap_numpy_scalar(step)
     if end is None:
         end = start
         start = 0
@@ -160,6 +179,7 @@ def arange(start=0, end=None, step=1, *, out=None, dtype=None, layout=None, devi
 
 
 def range(start, end, step=1, *, out=None, dtype=None, layout=None, device=None, requires_grad: bool = False) -> Tensor:
+    start, end, step = _unwrap_numpy_scalar(start), _unwrap_numpy_scalar(end), _unwrap_numpy_scalar(step)
     return arange(start, end + (step * 1e-9 if isinstance(step, float) else 1), step, out=out, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
 
 
@@ -337,13 +357,17 @@ def initial_seed() -> int:
     return _CURRENT_SEED
 
 
-def get_rng_state() -> Tensor:
+def _rng_state_raw() -> bytes:
+    """The state of the random number generator in the form set_rng_state() takes back."""
     import ctypes
     need = _C.lib.gt_rng_get_state(None, 0)
     buf = ctypes.create_string_buffer(need + 16)
     _C.lib.gt_rng_get_state(buf, need + 16)
-    raw = buf.value
-    return _from_python(list(raw), dtype=_dt.uint8)
+    return buf.value
+
+
+def get_rng_state() -> Tensor:
+    return _from_python(list(_rng_state_raw()), dtype=_dt.uint8)
 
 
 def set_rng_state(new_state: Tensor | bytes | bytearray) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import platform
 import sys
 from pathlib import Path
@@ -138,17 +139,36 @@ def _lib_name(stem: str) -> str:
     return f"lib{stem}.so"
 
 
+def _source_build_script() -> Path | None:
+    """build_native.py of the source checkout this package is imported from, if any.
+
+    An installed copy (site-packages) has neither the build script nor the C++
+    sources beside it. Requiring csrc/ as well keeps an unrelated build_native.py
+    that merely happens to sit next to the package from ever being executed.
+    """
+    script = _ROOT_DIR / "build_native.py"
+    if script.is_file() and (_ROOT_DIR / "csrc" / "gguf_train.h").is_file():
+        return script
+    return None
+
+
 def ensure_built(include_llama: bool = True) -> None:
-    gt_lib = _LIBS_DIR / _lib_name("gguf_train")
-    lb_lib = _LIBS_DIR / _lib_name("llama_bridge")
-    if gt_lib.exists() and (not include_llama or lb_lib.exists()):
+    wanted = [_LIBS_DIR / _lib_name("gguf_train")]
+    if include_llama:
+        wanted.append(_LIBS_DIR / _lib_name("llama_bridge"))
+    missing = [p for p in wanted if not p.exists()]
+    if not missing:
         return
 
-    build_script = _ROOT_DIR / "build_native.py"
-    if not build_script.exists():
+    build_script = _source_build_script()
+    if build_script is None:
+        names = ", ".join(p.name for p in missing)
         raise RuntimeError(
-            f"Native library not found at {gt_lib} and build_native.py is missing. "
-            "Please reinstall gguf_train from source."
+            f"gguf_train native libraries not found in {_LIBS_DIR}: {names}. "
+            "This copy of gguf_train is installed without them and cannot compile them itself, "
+            "because the C++ sources and build_native.py are only part of the source tree. "
+            "Reinstall from the source tree or sdist with a C/C++ compiler available and without "
+            "GGUF_TRAIN_SKIP_BUILD=1, e.g. `pip install --force-reinstall --no-cache-dir .`."
         )
     import importlib.util
 
@@ -159,6 +179,31 @@ def ensure_built(include_llama: bool = True) -> None:
     assert spec and spec.loader
     spec.loader.exec_module(mod)
     mod.build_direct(build_llama=include_llama)
+
+
+_dll_dir_handle = None
+
+
+def _register_dll_dir() -> None:
+    """Let Windows resolve the native libraries' dependencies from _libs.
+
+    Python 3.8+ no longer searches PATH for the DLLs a loaded DLL depends on.
+    gguf_train, llama_bridge, llama and ggml depend on one another and are loaded
+    at different times, so their directory has to be registered explicitly.
+    """
+    global _dll_dir_handle
+    if (
+        sys.platform == "win32"
+        and _dll_dir_handle is None
+        and hasattr(os, "add_dll_directory")
+        and _LIBS_DIR.is_dir()
+    ):
+        _dll_dir_handle = os.add_dll_directory(str(_LIBS_DIR))
+
+
+def _load_native(stem: str) -> ctypes.CDLL:
+    _register_dll_dir()
+    return ctypes.CDLL(str((_LIBS_DIR / _lib_name(stem)).resolve()))
 
 
 def _configure_gt_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
@@ -247,6 +292,14 @@ def _configure_gt_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.gt_tensor_data_ptr.restype = c_uint64
     lib.gt_tensor_storage_ptr.argtypes = [c_void_p]
     lib.gt_tensor_storage_ptr.restype = c_uint64
+    lib.gt_tensor_storage_host_ptr.argtypes = [c_void_p]
+    lib.gt_tensor_storage_host_ptr.restype = c_uint64
+    lib.gt_tensor_storage_nbytes.argtypes = [c_void_p]
+    lib.gt_tensor_storage_nbytes.restype = c_size_t
+    lib.gt_tensor_from_external.argtypes = [c_int, p_i64, p_i64, c_int, c_void_p, c_uint64]
+    lib.gt_tensor_from_external.restype = c_void_p
+    lib.gt_external_released.argtypes = [ctypes.POINTER(c_uint64), c_int64]
+    lib.gt_external_released.restype = c_int64
     lib.gt_tensor_nbytes.argtypes = [c_void_p]
     lib.gt_tensor_nbytes.restype = c_size_t
     lib.gt_tensor_elem_size.argtypes = [c_int]
@@ -489,6 +542,16 @@ def _configure_gt_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.gt_gguf_kv_type.restype = c_int
     lib.gt_gguf_kv_val_str.argtypes = [c_void_p, c_int64, c_char_p, c_int]
     lib.gt_gguf_kv_val_str.restype = c_int
+    lib.gt_gguf_save_ex.argtypes = [c_char_p, c_int, p_cp, p_vp, c_int, p_cp, p_i32, p_cp, p_i32, p_i64, p_vp, c_char_p]
+    lib.gt_gguf_save_ex.restype = c_int
+    lib.gt_gguf_kv_arr_type.argtypes = [c_void_p, c_int64]
+    lib.gt_gguf_kv_arr_type.restype = c_int
+    lib.gt_gguf_kv_arr_n.argtypes = [c_void_p, c_int64]
+    lib.gt_gguf_kv_arr_n.restype = c_int64
+    lib.gt_gguf_kv_arr_data.argtypes = [c_void_p, c_int64]
+    lib.gt_gguf_kv_arr_data.restype = c_void_p
+    lib.gt_gguf_kv_arr_str.argtypes = [c_void_p, c_int64, c_int64]
+    lib.gt_gguf_kv_arr_str.restype = c_char_p
     lib.gt_quantize.argtypes = [c_void_p, c_int]
     lib.gt_quantize.restype = c_void_p
     lib.gt_dequantize.argtypes = [c_void_p, c_int]
@@ -601,7 +664,7 @@ def _configure_llama_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
 
 
 ensure_built(include_llama=False)
-lib = _configure_gt_lib(ctypes.CDLL(str((_LIBS_DIR / _lib_name("gguf_train")).resolve())))
+lib = _configure_gt_lib(_load_native("gguf_train"))
 
 _llama_lib_cache: ctypes.CDLL | None = None
 
@@ -610,9 +673,7 @@ def llama_lib() -> ctypes.CDLL:
     global _llama_lib_cache
     if _llama_lib_cache is None:
         ensure_built(include_llama=True)
-        _llama_lib_cache = _configure_llama_lib(
-            ctypes.CDLL(str((_LIBS_DIR / _lib_name("llama_bridge")).resolve()))
-        )
+        _llama_lib_cache = _configure_llama_lib(_load_native("llama_bridge"))
     return _llama_lib_cache
 
 
@@ -621,14 +682,29 @@ def last_error() -> str:
     return msg.decode("utf-8", errors="replace") if msg else ""
 
 
+# A native message may name the Python exception it stands for: "IndexError: index 5 is out
+# of bounds ..." is raised as IndexError("index 5 is out of bounds ..."). Everything else is
+# a RuntimeError, prefixed with the operation that failed.
+_NATIVE_ERROR_TYPES = {"IndexError": IndexError}
+
+
+def _native_error(ctx: str, err: str, fallback: str) -> Exception:
+    for name, exc_type in _NATIVE_ERROR_TYPES.items():
+        tag = name + ": "
+        if err.startswith(tag):
+            return exc_type(err[len(tag):])
+    if ctx and err:
+        # the native message often names the operation already
+        return RuntimeError(err if err.startswith(ctx + ":") else f"{ctx}: {err}")
+    return RuntimeError(err or ctx or fallback)
+
+
 def check_ptr(ptr: int | None, ctx: str = "") -> int:
     if not ptr:
-        err = last_error()
-        raise RuntimeError(f"{ctx}: {err}" if ctx and err else (err or ctx or "Native operation returned NULL"))
+        raise _native_error(ctx, last_error(), "Native operation returned NULL")
     return ptr
 
 
 def check_rc(rc: int, ctx: str = "") -> None:
     if rc != 0:
-        err = last_error()
-        raise RuntimeError(f"{ctx}: {err}" if ctx and err else (err or ctx or f"Native operation failed with code {rc}"))
+        raise _native_error(ctx, last_error(), f"Native operation failed with code {rc}")

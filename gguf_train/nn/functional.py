@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from .. import _C, _autograd_state, _dtype as _dt
-from .._creation import ones, zeros, zeros_like
+from .._creation import ones, tensor as _tensor, zeros, zeros_like
 from .._functions import (
     AvgPool2dFn,
     BatchNormFn,
@@ -29,15 +29,25 @@ from .._functions import (
     Upsample2dFn,
 )
 from .._ops import cat, stack, where
-from .._tensor import Tensor
+from .._tensor import (
+    Tensor,
+    _AUTOCAST_FLOAT32,
+    _AUTOCAST_KEEP,
+    _AUTOCAST_LOWER,
+    _AUTOCAST_PROMOTE,
+    _autocast_float32,
+    _autocast_op,
+    _is_int,
+    _is_scalar,
+)
 
 
 def _pair(v) -> tuple[int, int]:
-    return (v, v) if isinstance(v, int) else (int(v[0]), int(v[1]))
+    return (int(v), int(v)) if _is_int(v) else (int(v[0]), int(v[1]))
 
 
 def _triple(v) -> tuple[int, int, int]:
-    return (v, v, v) if isinstance(v, int) else (int(v[0]), int(v[1]), int(v[2]))
+    return (int(v), int(v), int(v)) if _is_int(v) else (int(v[0]), int(v[1]), int(v[2]))
 
 
 def _reduce_loss(loss: Tensor, reduction: str) -> Tensor:
@@ -106,6 +116,7 @@ def selu(input: Tensor, inplace: bool = False) -> Tensor:
     return res
 
 
+@_autocast_op(_AUTOCAST_LOWER)
 def prelu(input: Tensor, weight: Tensor) -> Tensor:
     w = weight
     if w.ndim == 1 and w.numel() > 1 and input.ndim >= 2:
@@ -183,6 +194,7 @@ def logsigmoid(input: Tensor) -> Tensor:
     return UnarySimpleFn.apply(input, _C.UNARY_LOG_SIGMOID)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def softplus(input: Tensor, beta: float = 1.0, threshold: float = 20.0) -> Tensor:
     return UnarySimpleFn.apply(input, _C.UNARY_SOFTPLUS, float(beta), float(threshold))
 
@@ -217,7 +229,7 @@ def threshold(input: Tensor, threshold: float, value: float, inplace: bool = Fal
 def softmax(input: Tensor, dim: int | None = None, _stacklevel: int = 3, dtype=None) -> Tensor:
     (_stacklevel,)
     d = -1 if dim is None else dim
-    x = input if dtype is None else input.to(dtype)
+    (x,) = _autocast_float32(input) if dtype is None else (input.to(dtype),)
     return SoftmaxFn.apply(x, d, 0)
 
 
@@ -228,7 +240,7 @@ def softmin(input: Tensor, dim: int | None = None, dtype=None) -> Tensor:
 def log_softmax(input: Tensor, dim: int | None = None, _stacklevel: int = 3, dtype=None) -> Tensor:
     (_stacklevel,)
     d = -1 if dim is None else dim
-    x = input if dtype is None else input.to(dtype)
+    (x,) = _autocast_float32(input) if dtype is None else (input.to(dtype),)
     return SoftmaxFn.apply(x, d, 1)
 
 
@@ -246,10 +258,12 @@ def gumbel_softmax(logits: Tensor, tau: float = 1.0, hard: bool = False, eps: fl
 
 # ---------- Linear / Dropout / Embedding ----------
 
+@_autocast_op(_AUTOCAST_LOWER)
 def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     return LinearFn.apply(input, weight, bias)
 
 
+@_autocast_op(_AUTOCAST_PROMOTE)
 def bilinear(input1: Tensor, input2: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     # weight: (out_features, in1_features, in2_features)
     out_f = weight.shape[0]
@@ -319,9 +333,153 @@ def embedding(
     return EmbeddingFn.apply(weight, input, pidx)
 
 
+@_autocast_op(_AUTOCAST_KEEP)
+def embedding_bag(
+    input: Tensor,
+    weight: Tensor,
+    offsets: Tensor | None = None,
+    max_norm: float | None = None,
+    norm_type: float = 2.0,
+    scale_grad_by_freq: bool = False,
+    mode: str = "mean",
+    sparse: bool = False,
+    per_sample_weights: Tensor | None = None,
+    include_last_offset: bool = False,
+    padding_idx: int | None = None,
+) -> Tensor:
+    """Sums, means or maxima over bags of embeddings.
+
+    input 2-D (B, L): every row is a bag. input 1-D with offsets: bag i is
+    input[offsets[i]:offsets[i + 1]], the last one runs to the end of the input (or to the last
+    offset with include_last_offset). An empty bag gives zeros. Entries equal to padding_idx
+    are left out of the reduction; per_sample_weights (mode "sum") scales each entry.
+    """
+    (max_norm, norm_type, scale_grad_by_freq, sparse)
+    if mode not in ("sum", "mean", "max"):
+        raise ValueError(f"embedding_bag: mode has to be one of 'sum', 'mean' or 'max', got {mode!r}")
+    if weight.ndim != 2:
+        raise ValueError(f"embedding_bag: weight has to be a 2D tensor, got {weight.ndim}D")
+    if per_sample_weights is not None:
+        if mode != "sum":
+            raise NotImplementedError(
+                f"embedding_bag: per_sample_weights was not None. per_sample_weights is only supported for mode='sum' (got mode='{mode}')"
+            )
+        if per_sample_weights.shape != input.shape:
+            raise ValueError(
+                f"embedding_bag: per_sample_weights of shape {list(per_sample_weights.shape)} must have the shape of the input "
+                f"{list(input.shape)}"
+            )
+    n_rows, emb_dim = weight.shape
+    bounds = None                    # 1-D input: bag i covers [bounds[i], bounds[i + 1])
+    if input.ndim == 2:
+        if offsets is not None:
+            raise ValueError("embedding_bag: if input is 2D, then offsets has to be None, as every row of the input is a bag")
+        n_bags, bag_len = input.shape
+        flat = input.reshape((-1,))
+    elif input.ndim == 1:
+        if offsets is None:
+            raise ValueError("embedding_bag: offsets has to be a 1D tensor for a 1D input, got None")
+        if offsets.ndim != 1:
+            raise ValueError(f"embedding_bag: offsets has to be a 1D tensor, got {offsets.ndim}D")
+        if offsets.is_floating_point() or offsets.is_complex() or offsets.dtype == _dt.bool:
+            raise TypeError(f"embedding_bag: offsets has to be an integer tensor, got {offsets.dtype}")
+        bounds = [int(o) for o in offsets.tolist()]
+        total = input.shape[0]
+        if include_last_offset:
+            if not bounds:
+                raise ValueError("embedding_bag: include_last_offset needs at least one offset, the end of the last bag")
+        else:
+            bounds.append(total)
+        if len(bounds) > 1 and bounds[0] != 0:
+            raise ValueError(f"embedding_bag: offsets[0] has to be 0, the first bag starts at the first index, got {bounds[0]}")
+        if any(b2 < b1 for b1, b2 in zip(bounds, bounds[1:])):
+            raise ValueError("embedding_bag: offsets have to be in ascending order")
+        if bounds[-1] > total or bounds[0] < 0:
+            raise ValueError(f"embedding_bag: offsets cannot go beyond the length of the input ({total}), got {bounds[-1]}")
+        n_bags = len(bounds) - 1
+        flat = input if bounds[-1] == total else input[: bounds[-1]]
+        if per_sample_weights is not None and bounds[-1] != total:
+            per_sample_weights = per_sample_weights[: bounds[-1]]
+    else:
+        raise ValueError(f"embedding_bag: input has to be a 1D or 2D tensor, got {input.ndim}D")
+
+    pidx = None
+    if padding_idx is not None:
+        pidx = int(padding_idx) + n_rows if int(padding_idx) < 0 else int(padding_idx)
+        if not 0 <= pidx < n_rows:
+            raise ValueError(f"embedding_bag: padding_idx {padding_idx} is out of range for {n_rows} embeddings")
+
+    # (N, D); the row of padding_idx comes back as zeros and takes no gradient
+    emb = EmbeddingFn.apply(weight, flat, -1 if pidx is None else pidx)
+    keep = None if pidx is None else (flat != pidx)          # (N,) entries that count
+    if per_sample_weights is not None:
+        emb = emb * per_sample_weights.reshape((-1, 1)).to(emb.dtype)
+    if n_bags == 0:
+        return zeros((0, emb_dim), dtype=weight.dtype, device=weight.device)
+
+    if bounds is None:
+        # equal bags: one reduction over the bag dimension
+        bags = emb.reshape((n_bags, bag_len, emb_dim))
+        counts = None if keep is None else keep.reshape((n_bags, bag_len)).to(weight.dtype).sum(dim=1)
+        if bag_len == 0:
+            return zeros((n_bags, emb_dim), dtype=weight.dtype, device=weight.device)
+        if mode == "max":
+            if keep is None:
+                return bags.amax(dim=1)
+            hidden = (~keep).reshape((n_bags, bag_len, 1))
+            best = bags.masked_fill(hidden, float("-inf")).amax(dim=1)
+            return where((counts > 0).unsqueeze(-1), best, zeros_like(best))
+        total_emb = bags.sum(dim=1)
+        if mode == "sum":
+            return total_emb
+        if counts is None:
+            return total_emb / float(bag_len)
+        return total_emb / where(counts > 0, counts, zeros_like(counts) + 1.0).unsqueeze(-1)
+
+    sizes = [b2 - b1 for b1, b2 in zip(bounds, bounds[1:])]
+    if mode == "max":
+        rows = []
+        for i, size in enumerate(sizes):
+            seg = emb[bounds[i] : bounds[i + 1]]
+            if keep is not None and size > 0:
+                seg_keep = keep[bounds[i] : bounds[i + 1]]
+                if int(seg_keep.sum().item()) == 0:
+                    size = 0
+                else:
+                    seg = seg.masked_fill((~seg_keep).unsqueeze(-1), float("-inf"))
+            rows.append(seg.amax(dim=0) if size > 0 else zeros((emb_dim,), dtype=weight.dtype, device=weight.device))
+        return stack(rows, dim=0)
+
+    # ragged bags: add every row to the row of its bag
+    bag_of = [i for i, size in enumerate(sizes) for _ in range(size)]
+    out = zeros((n_bags, emb_dim), dtype=emb.dtype, device=emb.device)
+    if not bag_of:
+        return out
+    bag_ids = _tensor(bag_of, dtype=_dt.int64, device=emb.device)
+    out = out.scatter_add(0, bag_ids.unsqueeze(-1).expand(len(bag_of), emb_dim), emb)
+    if mode == "sum":
+        return out
+    if keep is None:
+        counts = _tensor([float(max(size, 1)) for size in sizes], dtype=emb.dtype, device=emb.device)
+    else:
+        counts = zeros((n_bags,), dtype=emb.dtype, device=emb.device).scatter_add(0, bag_ids, keep.to(emb.dtype))
+        counts = where(counts > 0, counts, zeros_like(counts) + 1.0)
+    return out / counts.unsqueeze(-1)
+
+
 def one_hot(tensor: Tensor, num_classes: int = -1) -> Tensor:
+    if tensor.dtype.is_floating_point or tensor.dtype.is_complex or tensor.dtype == _dt.bool:
+        raise RuntimeError(f"one_hot is only applicable to integer class indices, got {tensor.dtype}")
+    largest = -1
+    if tensor.numel() > 0:
+        largest = int(tensor.max().item())
+        if int(tensor.min().item()) < 0:
+            # scatter would count a negative index from the end and mark the wrong class
+            raise RuntimeError("one_hot: class values must be non-negative")
     if num_classes < 0:
-        num_classes = int(tensor.max().item()) + 1 if tensor.numel() > 0 else 1
+        num_classes = largest + 1 if tensor.numel() > 0 else 1
+    elif largest >= num_classes:
+        raise RuntimeError(f"one_hot: class value {largest} is out of range for num_classes={num_classes}")
     out_sh = tensor.shape + (num_classes,)
     idx = tensor.long().unsqueeze(-1)
     out = zeros(out_sh, dtype=_dt.int64, device=tensor.device)
@@ -336,6 +494,7 @@ def rms_norm(input: Tensor, normalized_shape, weight: Tensor | None = None, eps:
     return RMSNormFn.apply(input, weight, float(eps))
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def layer_norm(
     input: Tensor,
     normalized_shape,
@@ -343,10 +502,11 @@ def layer_norm(
     bias: Tensor | None = None,
     eps: float = 1e-5,
 ) -> Tensor:
-    norm_ndim = 1 if isinstance(normalized_shape, int) else len(normalized_shape)
+    norm_ndim = 1 if _is_int(normalized_shape) else len(normalized_shape)
     return LayerNormFn.apply(input, norm_ndim, weight, bias, float(eps))
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def group_norm(
     input: Tensor,
     num_groups: int,
@@ -370,6 +530,7 @@ def batch_norm(
     return BatchNormFn.apply(input, running_mean, running_var, weight, bias, bool(training), float(momentum), float(eps))
 
 
+@_autocast_op(_AUTOCAST_KEEP)
 def instance_norm(
     input: Tensor,
     running_mean: Tensor | None = None,
@@ -385,6 +546,7 @@ def instance_norm(
     return group_norm(input, C, weight=weight, bias=bias, eps=eps)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def normalize(input: Tensor, p: float = 2.0, dim: int = 1, eps: float = 1e-12, out=None) -> Tensor:
     denom = input.norm(p=p, dim=dim, keepdim=True).clamp(min=eps)
     res = input / denom
@@ -396,6 +558,7 @@ def normalize(input: Tensor, p: float = 2.0, dim: int = 1, eps: float = 1e-12, o
 
 # ---------- Convolutions & Pooling ----------
 
+@_autocast_op(_AUTOCAST_LOWER)
 def conv1d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1) -> Tensor:
     s = stride[0] if isinstance(stride, (tuple, list)) else int(stride)
     p = padding[0] if isinstance(padding, (tuple, list)) else int(padding)
@@ -403,10 +566,12 @@ def conv1d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride: in
     return Conv1dFn.apply(input, weight, bias, s, p, d, int(groups))
 
 
+@_autocast_op(_AUTOCAST_LOWER)
 def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0, dilation=1, groups: int = 1) -> Tensor:
     return Conv2dFn.apply(input, weight, bias, _pair(stride), _pair(padding), _pair(dilation), int(groups))
 
 
+@_autocast_op(_AUTOCAST_LOWER)
 def conv_transpose2d(
     input: Tensor,
     weight: Tensor,
@@ -422,6 +587,7 @@ def conv_transpose2d(
     )
 
 
+@_autocast_op(_AUTOCAST_LOWER)
 def conv3d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0, dilation=1, groups: int = 1) -> Tensor:
     return Conv3dFn.apply(input, weight, bias, _triple(stride), _triple(padding), _triple(dilation), int(groups))
 
@@ -464,36 +630,104 @@ def avg_pool1d(input: Tensor, kernel_size, stride=None, padding=0, ceil_mode: bo
     return avg_pool2d(input.unsqueeze(-2), (1, k), (1, s), (0, p), ceil_mode=ceil_mode, count_include_pad=count_include_pad).squeeze(-2)
 
 
+def _adaptive_sizes(name: str, input: Tensor, output_size) -> tuple[int, int]:
+    """(out_h, out_w) of an adaptive 2-D pooling; None keeps the input size of that dimension."""
+    if input.ndim not in (3, 4):
+        raise RuntimeError(f"{name}: expected a 3D (C, H, W) or 4D (N, C, H, W) input, got {input.ndim}D")
+    sizes = tuple(output_size) if isinstance(output_size, (tuple, list)) else (output_size, output_size)
+    if len(sizes) != 2:
+        raise RuntimeError(f"{name}: output_size must be an int or a pair, got {output_size!r}")
+    out = []
+    for o, i in zip(sizes, input.shape[-2:]):
+        o = i if o is None else int(o)
+        if o < 0:
+            raise RuntimeError(f"{name}: output_size must be non-negative, got {output_size!r}")
+        if i == 0 and o > 0:
+            raise RuntimeError(f"{name}: the input has an empty spatial dimension: {list(input.shape)}")
+        out.append(o)
+    return out[0], out[1]
+
+
+def _adaptive_windows(in_size: int, out_size: int) -> list[tuple[int, int]]:
+    """The windows of adaptive pooling: output i covers [floor(i*in/out), ceil((i+1)*in/out))."""
+    return [((i * in_size) // out_size, -((-(i + 1) * in_size) // out_size)) for i in range(out_size)]
+
+
+def _adaptive_avg_matrix(in_size: int, out_size: int, like: Tensor) -> Tensor:
+    """(out_size, in_size): row i holds 1/len(window i) on the inputs of window i."""
+    flat = []
+    for start, end in _adaptive_windows(in_size, out_size):
+        w = 1.0 / (end - start)
+        flat.extend(w if start <= k < end else 0.0 for k in range(in_size))
+    return _tensor(flat, dtype=like.dtype, device=like.device).reshape((out_size, in_size))
+
+
 def adaptive_avg_pool2d(input: Tensor, output_size) -> Tensor:
-    oh, ow = _pair(output_size)
+    oh, ow = _adaptive_sizes("adaptive_avg_pool2d", input, output_size)
     ih, iw = input.shape[-2], input.shape[-1]
     if oh == 1 and ow == 1:
         return input.mean(dim=(-2, -1), keepdim=True)
-    if ih % oh == 0 and iw % ow == 0:
+    if input.ndim == 4 and oh > 0 and ow > 0 and ih % oh == 0 and iw % ow == 0:
         sh, sw = ih // oh, iw // ow
         return avg_pool2d(input, (sh, sw), stride=(sh, sw))
-    return Upsample2dFn.apply(input, (oh, ow), 1, 0)
+    if not input.is_floating_point():
+        raise RuntimeError(f"adaptive_avg_pool2d: expected a floating point input, got {input.dtype}")
+    # Windows of unequal size. The mean over a rectangle is the mean over its rows, then over
+    # its columns: one matrix product per dimension, with the window averages as the matrix.
+    out = input
+    if oh != ih:
+        out = _adaptive_avg_matrix(ih, oh, input).matmul(out)
+    if ow != iw:
+        out = out.matmul(_adaptive_avg_matrix(iw, ow, input).transpose(0, 1))
+    return out
 
 
 def adaptive_avg_pool1d(input: Tensor, output_size: int) -> Tensor:
+    if input.ndim not in (2, 3):
+        raise RuntimeError(f"adaptive_avg_pool1d: expected a 2D (C, L) or 3D (N, C, L) input, got {input.ndim}D")
     return adaptive_avg_pool2d(input.unsqueeze(-2), (1, int(output_size))).squeeze(-2)
 
 
 def adaptive_max_pool2d(input: Tensor, output_size, return_indices: bool = False):
-    oh, ow = _pair(output_size)
+    oh, ow = _adaptive_sizes("adaptive_max_pool2d", input, output_size)
     ih, iw = input.shape[-2], input.shape[-1]
-    sh, sw = max(1, ih // oh), max(1, iw // ow)
-    kh = ih - (oh - 1) * sh
-    kw = iw - (ow - 1) * sw
-    return max_pool2d(input, (kh, kw), stride=(sh, sw), return_indices=return_indices)
+    if oh > 0 and ow > 0 and ih % oh == 0 and iw % ow == 0:
+        sh, sw = ih // oh, iw // ow
+        batched = input if input.ndim == 4 else input.unsqueeze(0)
+        res = max_pool2d(batched, (sh, sw), stride=(sh, sw), return_indices=return_indices)
+        if input.ndim == 4:
+            return res
+        return (res[0].squeeze(0), res[1].squeeze(0)) if return_indices else res.squeeze(0)
+    if oh == 0 or ow == 0:
+        empty_out = input[..., :oh, :ow]
+        return (empty_out, empty_out.long()) if return_indices else empty_out
+    # Windows of unequal size, [floor(i*in/out), ceil((i+1)*in/out)): the maximum of a rectangle
+    # is the maximum over its columns, then over its rows.
+    col_vals, col_idx = [], []
+    for start, end in _adaptive_windows(iw, ow):
+        v, i = input[..., :, start:end].max(dim=-1)
+        col_vals.append(v)
+        col_idx.append(i + start)
+    cols = stack(col_vals, dim=-1)              # (..., ih, ow)
+    cols_i = stack(col_idx, dim=-1)
+    out_vals, out_idx = [], []
+    for start, end in _adaptive_windows(ih, oh):
+        v, i = cols[..., start:end, :].max(dim=-2)
+        out_vals.append(v)
+        if return_indices:
+            col = cols_i[..., start:end, :].gather(-2, i.unsqueeze(-2)).squeeze(-2)
+            out_idx.append((i + start) * iw + col)   # position in the flattened (H, W) plane
+    values = stack(out_vals, dim=-2)
+    return (values, stack(out_idx, dim=-2)) if return_indices else values
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def interpolate(input: Tensor, size=None, scale_factor=None, mode: str = "nearest", align_corners: bool | None = None, recompute_scale_factor=None, antialias: bool = False) -> Tensor:
     (recompute_scale_factor, antialias)
     if size is not None:
         oh, ow = _pair(size)
     elif scale_factor is not None:
-        sf_h, sf_w = (float(scale_factor), float(scale_factor)) if isinstance(scale_factor, (int, float)) else (float(scale_factor[0]), float(scale_factor[1]))
+        sf_h, sf_w = (float(scale_factor), float(scale_factor)) if _is_scalar(scale_factor) else (float(scale_factor[0]), float(scale_factor[1]))
         oh = int(input.shape[-2] * sf_h)
         ow = int(input.shape[-1] * sf_w)
     else:
@@ -515,6 +749,7 @@ def pad(input: Tensor, pad, mode: str = "constant", value: float = 0.0) -> Tenso
 
 # ---------- Attention / RoPE / SwiGLU ----------
 
+@_autocast_op(_AUTOCAST_LOWER)
 def scaled_dot_product_attention(
     query: Tensor,
     key: Tensor,
@@ -527,6 +762,17 @@ def scaled_dot_product_attention(
 ) -> Tensor:
     (enable_gqa,)
     sc = (1.0 / math.sqrt(query.shape[-1])) if scale is None else float(scale)
+    if attn_mask is not None:
+        # bool: True = may attend; float: added to the scores. Broadcast against (B, H, L, S).
+        if query.ndim == 4 and key.ndim == 4:
+            want = (query.shape[0], query.shape[1], query.shape[2], key.shape[2])
+            if attn_mask.ndim > 4 or any(m != 1 and m != w for m, w in zip(reversed(attn_mask.shape), reversed(want))):
+                raise RuntimeError(
+                    f"scaled_dot_product_attention: attn_mask of shape {list(attn_mask.shape)} cannot be broadcast "
+                    f"to the attention weights {list(want)}"
+                )
+            if attn_mask.ndim != 4:
+                attn_mask = attn_mask.reshape((1,) * (4 - attn_mask.ndim) + tuple(attn_mask.shape))
     if dropout_p == 0.0:
         return FlashAttentionFn.apply(query, key, value, attn_mask, sc, is_causal)
     # Dropout path uses differentiable operations directly
@@ -560,17 +806,20 @@ def swiglu(x: Tensor, up: Tensor) -> Tensor:
 
 # ---------- Loss Functions ----------
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def mse_loss(input: Tensor, target: Tensor, size_average=None, reduce=None, reduction: str = "mean") -> Tensor:
     (size_average, reduce)
     diff = input - target
     return _reduce_loss(diff * diff, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def l1_loss(input: Tensor, target: Tensor, size_average=None, reduce=None, reduction: str = "mean") -> Tensor:
     (size_average, reduce)
     return _reduce_loss((input - target).abs(), reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def smooth_l1_loss(input: Tensor, target: Tensor, size_average=None, reduce=None, reduction: str = "mean", beta: float = 1.0) -> Tensor:
     (size_average, reduce)
     diff = (input - target).abs()
@@ -578,12 +827,45 @@ def smooth_l1_loss(input: Tensor, target: Tensor, size_average=None, reduce=None
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def huber_loss(input: Tensor, target: Tensor, reduction: str = "mean", delta: float = 1.0) -> Tensor:
     diff = (input - target).abs()
     loss = where(diff < delta, 0.5 * (diff * diff), delta * (diff - 0.5 * delta))
     return _reduce_loss(loss, reduction)
 
 
+def _class_loss_layout(name: str, input: Tensor, weight: Tensor | None):
+    """What cross_entropy and nll_loss agree on: the class dimension, the class count, and the
+    shape a tensor of class indices has to have."""
+    if input.ndim < 1:
+        raise RuntimeError(f"{name}: input needs a class dimension: (C), (N, C) or (N, C, d1, ...)")
+    class_dim = 1 if input.ndim >= 2 else 0
+    n_classes = input.shape[class_dim]
+    if weight is not None and tuple(weight.shape) != (n_classes,):
+        raise RuntimeError(
+            f"{name}: weight tensor should be defined either for all {n_classes} classes or no classes "
+            f"but got weight tensor of shape: {list(weight.shape)}"
+        )
+    index_shape = input.shape[:1] + input.shape[2:] if input.ndim >= 2 else ()
+    return class_dim, n_classes, index_shape
+
+
+def _class_index_target(name: str, input: Tensor, target: Tensor, index_shape: tuple) -> Tensor:
+    """`target` as class indices of exactly `index_shape`. The same number of elements in another
+    arrangement would pair every target with the wrong position."""
+    if target.is_floating_point() or target.is_complex() or target.dtype == _dt.bool:
+        raise RuntimeError(f"{name}: class indices must be an integer tensor, got {target.dtype}")
+    if target.shape == index_shape:
+        return target
+    if input.ndim == 1 and target.numel() == 1:
+        return target.reshape(())      # one item: (1,) says the same as ()
+    raise RuntimeError(
+        f"{name}: expected a target of shape {list(index_shape)} for an input of shape {list(input.shape)}, "
+        f"got {list(target.shape)}"
+    )
+
+
+@_autocast_op(_AUTOCAST_FLOAT32)
 def cross_entropy(
     input: Tensor,
     target: Tensor,
@@ -595,27 +877,35 @@ def cross_entropy(
     label_smoothing: float = 0.0,
 ) -> Tensor:
     (size_average, reduce)
-    if target.is_floating_point() and target.shape == input.shape:
-        log_probs = log_softmax(input, dim=1 if input.ndim >= 2 else 0)
-        tgt = target
-        if label_smoothing > 0.0:
-            c = input.shape[1 if input.ndim >= 2 else 0]
-            tgt = tgt * (1.0 - label_smoothing) + label_smoothing / float(c)
-        if weight is not None and input.ndim >= 2:
-            w_sh = [1] * input.ndim
-            w_sh[1] = weight.shape[0]
-            per_sample = -(tgt * log_probs * weight.reshape(tuple(w_sh))).sum(dim=1)
-        else:
-            per_sample = -(tgt * log_probs).sum(dim=1 if input.ndim >= 2 else 0)
-        return _reduce_loss(per_sample, reduction)
-
     red_map = {"none": 0, "mean": 1, "sum": 2}
     if reduction not in red_map:
         raise ValueError(f"Invalid reduction: {reduction!r}")
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise RuntimeError(f"label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}")
+    class_dim, n_classes, index_shape = _class_loss_layout("cross_entropy", input, weight)
+
+    if target.is_floating_point():
+        # class probabilities
+        if target.shape != input.shape:
+            raise RuntimeError(
+                f"cross_entropy: a floating point target holds class probabilities and needs the shape of the input "
+                f"{list(input.shape)}, got {list(target.shape)}; class indices must be an integer tensor"
+            )
+        log_probs = log_softmax(input, dim=class_dim)
+        tgt = target
+        if label_smoothing > 0.0:
+            tgt = tgt * (1.0 - label_smoothing) + label_smoothing / float(n_classes)
+        weighted = tgt * log_probs
+        if weight is not None:
+            w_sh = [1] * input.ndim
+            w_sh[class_dim] = n_classes
+            weighted = weighted * weight.reshape(tuple(w_sh))
+        return _reduce_loss(-weighted.sum(dim=class_dim), reduction)
+
+    target = _class_index_target("cross_entropy", input, target, index_shape)
     if input.ndim > 2:
         # Flatten (N, C, d1, ...) -> (N*d1*..., C)
-        C = input.shape[1]
-        inp_flat = input.movedim(1, -1).reshape((-1, C))
+        inp_flat = input.movedim(1, -1).reshape((-1, n_classes))
         tgt_flat = target.reshape((-1,))
         loss = CrossEntropyFn.apply(inp_flat, tgt_flat, weight, int(ignore_index), float(label_smoothing), red_map[reduction])
         if reduction == "none":
@@ -624,18 +914,31 @@ def cross_entropy(
     return CrossEntropyFn.apply(input, target, weight, int(ignore_index), float(label_smoothing), red_map[reduction])
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def nll_loss(input: Tensor, target: Tensor, weight: Tensor | None = None, size_average=None, ignore_index: int = -100, reduce=None, reduction: str = "mean") -> Tensor:
     (size_average, reduce)
+    if reduction not in ("none", "mean", "sum"):
+        raise ValueError(f"Invalid reduction: {reduction!r}")
+    _, n_classes, index_shape = _class_loss_layout("nll_loss", input, weight)
+    target = _class_index_target("nll_loss", input, target, index_shape)
     # Gather -input[i, target[i]]
     if input.ndim > 2:
-        C = input.shape[1]
-        inp = input.movedim(1, -1).reshape((-1, C))
+        inp = input.movedim(1, -1).reshape((-1, n_classes))
         tgt = target.reshape((-1,))
+    elif input.ndim == 1:
+        inp = input.unsqueeze(0)
+        tgt = target.reshape((1,))
     else:
         inp = input
         tgt = target
     valid = tgt != ignore_index
-    safe_tgt = where(valid, tgt, zeros_like(tgt)).unsqueeze(-1)
+    safe_tgt = where(valid, tgt, zeros_like(tgt))
+    if safe_tgt.numel() > 0:
+        lowest, highest = int(safe_tgt.min().item()), int(safe_tgt.max().item())
+        if lowest < 0 or highest >= n_classes:
+            # gather would count a negative class from the end
+            raise RuntimeError(f"nll_loss: target {lowest if lowest < 0 else highest} is out of bounds for {n_classes} classes")
+    safe_tgt = safe_tgt.unsqueeze(-1)
     picked = -inp.gather(1, safe_tgt).squeeze(-1)
     if weight is not None:
         w = weight.index_select(0, safe_tgt.squeeze(-1))
@@ -645,12 +948,14 @@ def nll_loss(input: Tensor, target: Tensor, weight: Tensor | None = None, size_a
         denom = valid.to(inp.dtype).sum()
     picked = where(valid, picked, zeros_like(picked))
     if reduction == "none":
-        return picked.reshape(target.shape) if input.ndim > 2 else picked
+        return picked.reshape(target.shape)
     if reduction == "sum":
         return picked.sum()
-    return picked.sum() / denom.clamp(min=1.0)
+    # the weights of the targets that count; when none counts the sum above is 0 and so is the loss
+    return picked.sum() / where(denom > 0, denom, zeros_like(denom) + 1.0)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def binary_cross_entropy(input: Tensor, target: Tensor, weight: Tensor | None = None, size_average=None, reduce=None, reduction: str = "mean") -> Tensor:
     (size_average, reduce)
     eps = 1e-12
@@ -661,6 +966,7 @@ def binary_cross_entropy(input: Tensor, target: Tensor, weight: Tensor | None = 
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def binary_cross_entropy_with_logits(
     input: Tensor,
     target: Tensor,
@@ -683,6 +989,7 @@ def binary_cross_entropy_with_logits(
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def kl_div(input: Tensor, target: Tensor, size_average=None, reduce=None, reduction: str = "mean", log_target: bool = False) -> Tensor:
     (size_average, reduce)
     if log_target:
@@ -694,6 +1001,7 @@ def kl_div(input: Tensor, target: Tensor, size_average=None, reduce=None, reduct
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def cosine_embedding_loss(input1: Tensor, input2: Tensor, target: Tensor, margin: float = 0.0, reduction: str = "mean") -> Tensor:
     from .._ops import cosine_similarity
     cos = cosine_similarity(input1, input2, dim=1 if input1.ndim >= 2 else 0)
@@ -701,11 +1009,13 @@ def cosine_embedding_loss(input1: Tensor, input2: Tensor, target: Tensor, margin
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def margin_ranking_loss(input1: Tensor, input2: Tensor, target: Tensor, margin: float = 0.0, reduction: str = "mean") -> Tensor:
     loss = (-target * (input1 - input2) + margin).clamp(min=0.0)
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def triplet_margin_loss(anchor: Tensor, positive: Tensor, negative: Tensor, margin: float = 1.0, p: float = 2.0, eps: float = 1e-6, swap: bool = False, reduction: str = "mean") -> Tensor:
     d_ap = ((anchor - positive) ** 2 + eps).sum(dim=-1).sqrt() if p == 2.0 else (anchor - positive).norm(p=p, dim=-1)
     d_an = ((anchor - negative) ** 2 + eps).sum(dim=-1).sqrt() if p == 2.0 else (anchor - negative).norm(p=p, dim=-1)
@@ -716,6 +1026,7 @@ def triplet_margin_loss(anchor: Tensor, positive: Tensor, negative: Tensor, marg
     return _reduce_loss(loss, reduction)
 
 
+@_autocast_op(_AUTOCAST_FLOAT32)
 def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = 1, eps: float = 1e-8) -> Tensor:
     from .._ops import cosine_similarity as _cs
     return _cs(x1, x2, dim=dim, eps=eps)

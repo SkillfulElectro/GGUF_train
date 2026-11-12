@@ -46,8 +46,15 @@ GT_API gt_tensor * gt_llama_forward_logits(gt_llama_context * c, const int32_t *
 // Forward embeddings on tokens -> returns gt_tensor of shape (1, n_embd) or (n_tokens, n_embd) F32
 GT_API gt_tensor * gt_llama_forward_embeddings(gt_llama_context * c, const int32_t * tokens, int32_t n_tokens);
 
-// Fine-tune a GGUF model via llama_opt_init + llama_opt_epoch on tokenized dataset
-// tokens_data: array of n_samples * n_ctx_seq int32 tokens (each sequence of length seq_len)
+// Fine-tune a GGUF model in place on next-token prediction (llama_opt_init + llama_opt_epoch).
+// tokens_data: n_samples * seq_len int32 token ids, one sequence of seq_len tokens after another.
+// Every sequence is trained as an independent sample of min(seq_len - 1, n_ctx) positions; no
+// padding is trained on. Training runs in a temporary context, so `c` stays usable for inference
+// (its KV cache is cleared) and the call can be repeated.
+// Requirements, reported through the return value instead of llama.cpp's process-aborting
+// assertions: the model was loaded without mmap, batch_size == 1 (llama.cpp takes one optimizer
+// step per sequence), lr > 0, 0 <= wd <= 1, 0 <= val_split < 1, all token ids inside the vocabulary.
+// Returns 0 on success, non-zero on failure (see gt_last_error()).
 GT_API int gt_llama_finetune(gt_llama_context * c, const int32_t * tokens_data, int64_t n_samples, int64_t seq_len,
                              int epochs, int64_t batch_size, double lr, double wd, float val_split, int optimizer_type);
 

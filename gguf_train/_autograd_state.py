@@ -12,6 +12,7 @@ def _state():
         _tls.grad_enabled = True
         _tls.inference_mode = False
         _tls.detect_anomaly = False
+        _tls.recorder = None        # see _autograd_engine._Recorder
     return _tls
 
 

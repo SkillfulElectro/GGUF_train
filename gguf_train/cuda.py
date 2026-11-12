@@ -96,8 +96,15 @@ def reset_peak_memory_stats(device=None) -> None:
     (device,)
 
 
+class _CudaAutocast(autocast):
+    """torch.cuda.amp.autocast(enabled=True, dtype=torch.float16): autocast for CUDA tensors."""
+
+    def __init__(self, enabled: bool = True, dtype=None, cache_enabled=None):
+        super().__init__("cuda", dtype=dtype, enabled=enabled, cache_enabled=cache_enabled)
+
+
 class _CudaAmp:
-    autocast = autocast
+    autocast = _CudaAutocast
     GradScaler = GradScaler
 
 

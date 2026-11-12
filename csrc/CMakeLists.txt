@@ -34,7 +34,8 @@ target_include_directories(gguf_train PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${LLAMA_CPP_DIR}/ggml/include"
 )
-target_compile_definitions(gguf_train PRIVATE GT_BUILD GGML_SHARED)
+# GT_BUILD_SHARED is the macro gguf_train.h keys GT_API on (dllexport when building the DLLs).
+target_compile_definitions(gguf_train PRIVATE GT_BUILD_SHARED GGML_SHARED)
 target_link_libraries(gguf_train PRIVATE ggml)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(gguf_train PRIVATE OpenMP::OpenMP_CXX)
@@ -48,7 +49,7 @@ target_include_directories(llama_bridge PUBLIC
     "${LLAMA_CPP_DIR}/include"
     "${LLAMA_CPP_DIR}/ggml/include"
 )
-target_compile_definitions(llama_bridge PRIVATE GT_BUILD GGML_SHARED LLAMA_SHARED)
+target_compile_definitions(llama_bridge PRIVATE GT_BUILD_SHARED GGML_SHARED LLAMA_SHARED)
 target_link_libraries(llama_bridge PRIVATE gguf_train llama ggml)
 
 if(APPLE)

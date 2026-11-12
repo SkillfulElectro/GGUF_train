@@ -37,9 +37,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel build
 
+      # Builds against the llama.cpp revision pinned in build_native.py.
       - name: Build native libraries (ggml + llama.cpp bridge)
         run: |
-          python build_native.py -j 4 --refresh-llama
+          python build_native.py -j 4
         env:
           GGUF_TRAIN_BUILD_JOBS: "4"
 

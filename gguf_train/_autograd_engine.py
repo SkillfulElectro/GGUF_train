@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import itertools
 import weakref
 
 from . import _autograd_state
+from .amp import _suspended as _autocast_suspended
+
+# Every graph node gets the next number when it is created: a node is older than everything
+# made after it. torch.utils.checkpoint uses that to tell the tensors a function creates from
+# the ones it is given.
+_node_seq = itertools.count(1)
 
 
 class Context:
@@ -35,7 +42,7 @@ class Context:
 class GradNode:
     """Node in the dynamic backward graph."""
 
-    __slots__ = ("fn_cls", "ctx", "next_edges", "input_requires_grad", "num_outputs", "output_refs", "name", "__weakref__")
+    __slots__ = ("fn_cls", "ctx", "next_edges", "input_requires_grad", "num_outputs", "output_refs", "name", "seq", "__weakref__")
 
     def __init__(
         self,
@@ -52,6 +59,7 @@ class GradNode:
         self.num_outputs = num_outputs
         self.output_refs: list = [None] * num_outputs
         self.name = f"{fn_cls.__name__}Backward0"
+        self.seq = next(_node_seq)
 
     @property
     def next_functions(self):
@@ -59,6 +67,42 @@ class GradNode:
 
     def __repr__(self) -> str:
         return f"<{self.name} at 0x{id(self):x}>"
+
+
+class _Recorder:
+    """``with _Recorder() as rec:`` - collects the tensors that the operations run inside take
+    in from outside: tensors that require grad and are leaves or were computed before the block
+    was entered. Those are exactly the tensors a gradient of anything computed inside can flow
+    back to. It records whether or not grad mode is on, which lets torch.utils.checkpoint run
+    a function under no_grad and still learn what its result depends on.
+
+    ``rec.found`` maps id(tensor) to the tensor, in the order of first use; ``rec.mark``
+    separates the graph nodes made before the block (``node.seq < mark``) from those made in it.
+    Recorders nest: operations report to the innermost one of their thread.
+    """
+
+    __slots__ = ("mark", "found", "_previous")
+
+    def __enter__(self):
+        st = _autograd_state._state()
+        self._previous = st.recorder
+        self.found = {}
+        self.mark = next(_node_seq)
+        st.recorder = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _autograd_state._state().recorder = self._previous
+        return False
+
+    def note(self, args, flags) -> None:
+        found = self.found
+        mark = self.mark
+        for a, requires_grad in zip(args, flags):
+            if requires_grad:
+                fn = a._grad_fn
+                if (fn is None or fn.seq < mark) and id(a) not in found:
+                    found[id(a)] = a
 
 
 class Function:
@@ -85,7 +129,10 @@ class Function:
                 raw_inputs_flags.append(False)
 
         ctx.needs_input_grad = tuple(raw_inputs_flags)
-        any_requires_grad = _autograd_state.is_grad_enabled() and any(raw_inputs_flags)
+        state = _autograd_state._state()
+        any_requires_grad = state.grad_enabled and not state.inference_mode and any(raw_inputs_flags)
+        if state.recorder is not None:
+            state.recorder.note(args, raw_inputs_flags)
 
         with _autograd_state.no_grad():
             outputs = cls.forward(ctx, *args, **kwargs)
@@ -147,7 +194,14 @@ def _run_autograd(
     create_graph: bool,
     allow_unused: bool,
     materialize_grads: bool,
+    stop_before: int = 0,
+    leaf_hooks: bool = True,
 ):
+    """One reverse pass. ``stop_before`` bounds it: graph nodes older than that number (see
+    `_node_seq`) are not entered, and a tensor one of them produced collects its gradient the
+    way a leaf does - it can be asked for in ``inputs``. torch.utils.checkpoint differentiates
+    the graph of a recomputed function that way, without touching the graph around it; it also
+    turns ``leaf_hooks`` off, because the pass around it runs them on the complete gradient."""
     from ._tensor import Tensor
     from ._creation import ones_like, zeros_like
 
@@ -167,30 +221,47 @@ def _run_autograd(
             for o, g in zip(out_list, g_list)
         ]
 
+    def _inside(t) -> bool:
+        """Whether `t` was computed by a node this pass goes through."""
+        return t._grad_fn is not None and t._grad_fn.seq >= stop_before
+
+    # Depth-first search for the order in which to run the nodes: a node is listed after
+    # everything it leads to. A loop with its own stack rather than a recursive function -
+    # the depth of a graph is not bounded by Python's recursion limit (a chain of a few
+    # thousand operations is an ordinary graph), and a function that refers to itself would
+    # keep the whole graph alive after the pass until the garbage collector finds the cycle.
     visited: set[int] = set()
     topo: list[GradNode] = []
-
-    def _dfs(node: GradNode | None):
-        if node is None or id(node) in visited:
-            return
-        visited.add(id(node))
-        for inp_t, _ in node.next_edges:
-            if inp_t is not None and inp_t._grad_fn is not None:
-                _dfs(inp_t._grad_fn)
-        topo.append(node)
-
     for o in out_list:
-        if o._grad_fn is not None:
-            _dfs(o._grad_fn)
-        elif not o.requires_grad:
-            raise RuntimeError("element 0 of tensors does not require grad and does not have a grad_fn")
+        if not _inside(o):
+            if not o.requires_grad:
+                raise RuntimeError("element 0 of tensors does not require grad and does not have a grad_fn")
+            continue
+        root = o._grad_fn
+        if id(root) in visited:
+            continue
+        visited.add(id(root))
+        stack = [(root, iter(root.next_edges))]
+        while stack:
+            node, edges = stack[-1]
+            for inp_t, _ in edges:
+                if inp_t is None:
+                    continue
+                fn = inp_t._grad_fn
+                if fn is not None and fn.seq >= stop_before and id(fn) not in visited:
+                    visited.add(id(fn))
+                    stack.append((fn, iter(fn.next_edges)))
+                    break
+            else:
+                topo.append(node)
+                stack.pop()
 
     node_grads: dict[int, list] = {}
     leaf_grads: dict[int, Tensor] = {}
     tensor_by_id: dict[int, Tensor] = {}
 
     for o, g in zip(out_list, g_list):
-        if o._grad_fn is not None:
+        if _inside(o):
             nid = id(o._grad_fn)
             if nid not in node_grads:
                 node_grads[nid] = [None] * o._grad_fn.num_outputs
@@ -233,7 +304,7 @@ def _run_autograd(
                 if inp_t.dtype != g_in.dtype and (inp_t.dtype.is_floating_point or inp_t.dtype.is_complex):
                     g_in = g_in.to(inp_t.dtype)
 
-                if inp_t._grad_fn is not None:
+                if _inside(inp_t):
                     pnid = id(inp_t._grad_fn)
                     if pnid not in node_grads:
                         node_grads[pnid] = [None] * inp_t._grad_fn.num_outputs
@@ -251,7 +322,7 @@ def _run_autograd(
                 node.ctx._saved_tensors = ()
 
         # Apply leaf tensor hooks once on the fully-accumulated gradient
-        for tid, g in list(leaf_grads.items()):
+        for tid, g in list(leaf_grads.items()) if leaf_hooks else ():
             t = tensor_by_id[tid]
             if t._hooks and t._grad_fn is None:
                 for hk in list(t._hooks.values()):
@@ -297,15 +368,18 @@ def backward(
 ) -> None:
     if retain_graph is None:
         retain_graph = create_graph
-    _run_autograd(
-        outputs=tensors,
-        grad_outputs=grad_tensors,
-        inputs=inputs,
-        retain_graph=bool(retain_graph),
-        create_graph=bool(create_graph),
-        allow_unused=True,
-        materialize_grads=False,
-    )
+    # the backward of an operation runs in the types its forward ran in, also inside an
+    # autocast block (torch.amp: "backward ops run in the same type that autocast used")
+    with _autocast_suspended():
+        _run_autograd(
+            outputs=tensors,
+            grad_outputs=grad_tensors,
+            inputs=inputs,
+            retain_graph=bool(retain_graph),
+            create_graph=bool(create_graph),
+            allow_unused=True,
+            materialize_grads=False,
+        )
 
 
 def grad(
@@ -317,16 +391,21 @@ def grad(
     only_inputs: bool = True,
     allow_unused: bool = False,
     materialize_grads: bool = False,
+    _stop_before: int = 0,
+    _leaf_hooks: bool = True,
 ) -> tuple:
     (only_inputs,)
     if retain_graph is None:
         retain_graph = create_graph
-    return _run_autograd(
-        outputs=outputs,
-        grad_outputs=grad_outputs,
-        inputs=inputs,
-        retain_graph=bool(retain_graph),
-        create_graph=bool(create_graph),
-        allow_unused=bool(allow_unused),
-        materialize_grads=bool(materialize_grads),
-    )
+    with _autocast_suspended():
+        return _run_autograd(
+            outputs=outputs,
+            grad_outputs=grad_outputs,
+            inputs=inputs,
+            retain_graph=bool(retain_graph),
+            create_graph=bool(create_graph),
+            allow_unused=bool(allow_unused),
+            materialize_grads=bool(materialize_grads),
+            stop_before=_stop_before,
+            leaf_hooks=_leaf_hooks,
+        )

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import array
 import ctypes
+import functools
+import itertools
 import math
+import numbers
+import operator
 import struct
 import sys
+import warnings
 
 from . import _C, _autograd_state, _device as _dev, _dtype as _dt
+from .amp import _active as _autocast_active, _suspended as _autocast_suspended
 from ._autograd_engine import backward as _autograd_backward
 from ._functions import (
     AddFn,
@@ -22,16 +28,20 @@ from ._functions import (
     ConjFn,
     ContiguousFn,
     CumsumFn,
+    DiagonalFn,
+    DiagonalScatterFn,
     DivFn,
     ExpandFn,
     FlipFn,
     GatherFn,
     ImagFn,
     IndexSelectFn,
+    IndexTensorFn,
     LerpFn,
     LinalgDetFn,
     LinalgInvFn,
     LinalgSolveFn,
+    MaskedSelectFn,
     MatMulFn,
     MaximumFn,
     MinimumFn,
@@ -57,61 +67,425 @@ from ._functions import (
     WhereFn,
     _c_i32_arr,
     _c_i64_arr,
+    _can_view_reshape,
     _wrap,
 )
 
 
+# ---------- NumPy interoperability ----------
+# NumPy is optional. It is never imported on behalf of the caller: an ndarray or a NumPy scalar
+# can only get here after the caller has imported NumPy, and sys.modules is where it is found.
+
+_NUMPY_DTYPE_NAMES = {
+    "float32": _dt.float32,
+    "float64": _dt.float64,
+    "float16": _dt.float16,
+    "int64": _dt.int64,
+    "int32": _dt.int32,
+    "int16": _dt.int16,
+    "int8": _dt.int8,
+    "uint8": _dt.uint8,
+    "bool": _dt.bool,
+    "complex64": _dt.complex64,
+    "complex128": _dt.complex128,
+}
+_NUMPY_NAME_OF_DTYPE = {dt: name for name, dt in _NUMPY_DTYPE_NAMES.items()}
+_NUMPY_SUPPORTED = "float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint8, and bool"
+
+
+class _ArrayLayoutError(TypeError, ValueError):
+    """An ndarray whose memory a tensor cannot use as it is (negative or fractional strides,
+    foreign byte order, unaligned data).
+
+    PyTorch raises ValueError for these. Every other input from_numpy() rejects is a TypeError,
+    and callers that catch that for "this cannot become a tensor" should get these too, so the
+    exception is both."""
+
+
+def _numpy():
+    return sys.modules.get("numpy")
+
+
+def _dtype_from_numpy(np_dtype) -> _dt.dtype:
+    """The tensor dtype with the layout of a NumPy dtype; TypeError when there is none."""
+    dt = _NUMPY_DTYPE_NAMES.get(np_dtype.name)
+    if dt is None:
+        kind = getattr(np_dtype.type, "__name__", str(np_dtype))
+        raise TypeError(f"can't convert np.ndarray of type numpy.{kind}. The only supported types are: {_NUMPY_SUPPORTED}.")
+    return dt
+
+
+def _unwrap_numpy_scalar(x):
+    """np.float32(2.0), np.int64(3), np.bool_(True), ... as the Python scalar of the same value.
+
+    In arithmetic and as fill values NumPy scalars behave like Python numbers: they do not
+    decide the dtype of the result."""
+    np = _numpy()
+    if np is None or not isinstance(x, np.generic):
+        return x
+    value = x.item()
+    if isinstance(value, (bool, int, float, complex)):
+        return value
+    # np.longdouble and np.clongdouble have no Python equivalent and return themselves
+    if isinstance(x, np.floating):
+        return float(x)
+    if isinstance(x, np.complexfloating):
+        return complex(x)
+    return x
+
+
+def _is_real_number(x) -> bool:
+    """A real scalar other than a bool: Python int and float, NumPy integer and floating scalars."""
+    t = type(x)
+    if t is float or t is int:
+        return True
+    if t is bool or isinstance(x, Tensor):
+        return False
+    # NumPy registers its integer and floating scalars with the numbers ABCs (np.bool_ is not one)
+    return isinstance(x, numbers.Real)
+
+
+def _is_int(x) -> bool:
+    """A Python int or a NumPy integer scalar - not a bool."""
+    t = type(x)
+    if t is int:
+        return True
+    if t is bool or isinstance(x, Tensor):
+        return False
+    return isinstance(x, numbers.Integral)
+
+
+def _dims_tuple(dim) -> tuple:
+    """dim=1, dim=np.int64(1), dim=(0, 1) or dim=[0, np.int64(1)] as a tuple of ints."""
+    try:
+        return (operator.index(dim),)
+    except TypeError:
+        return tuple(operator.index(d) for d in dim)
+
+
+def _numpy_style_reduction(fn):
+    """Lets a reduction be called the NumPy way: ``axis=`` for ``dim=``, ``keepdims=`` for
+    ``keepdim=``, and ``out=None``. PyTorch accepts these spellings, and they are how
+    np.sum(t), np.mean(t), np.max(t), ... call the method of an object that is not an array."""
+
+    @functools.wraps(fn)
+    def reduction(self, *args, **kwargs):
+        if kwargs:
+            if "axis" in kwargs:
+                if "dim" in kwargs:
+                    raise TypeError(f"{fn.__name__}() got both 'dim' and 'axis'")
+                kwargs["dim"] = kwargs.pop("axis")
+            if "keepdims" in kwargs:
+                if "keepdim" in kwargs:
+                    raise TypeError(f"{fn.__name__}() got both 'keepdim' and 'keepdims'")
+                kwargs["keepdim"] = kwargs.pop("keepdims")
+            if "out" in kwargs and kwargs.pop("out") is not None:
+                raise TypeError(f"{fn.__name__}(): out= is not supported")
+        return fn(self, *args, **kwargs)
+
+    return reduction
+
+
+def _check_expands_to(t, shape: tuple, what: str) -> None:
+    """`t` must broadcast to exactly `shape` (the `input` of addmm, baddbmm)."""
+    have = tuple(t.shape)
+    if len(have) > len(shape) or any(h != 1 and h != w for h, w in zip(reversed(have), reversed(shape))):
+        raise RuntimeError(
+            f"{what}: the expanded size of the tensor must match the existing size: "
+            f"input of shape {list(have)} cannot be broadcast to {list(shape)}"
+        )
+
+
+# ---------- autocast (torch.amp) ----------
+#
+# The policy - which operation is cast to what - is described in amp.py. Operations that are a
+# single native call cast their operands in place (`_autocast_lower`, `_autocast_float32`);
+# operations written in terms of other operations carry `@_autocast_op(...)`, which casts the
+# arguments and then runs the body with autocast suspended, so that nothing inside is cast a
+# second time, to something else.
+
+_AUTOCAST_LOWER = "lower"        # the autocast dtype: float16 / bfloat16
+_AUTOCAST_FLOAT32 = "float32"
+_AUTOCAST_PROMOTE = "promote"    # float32 as soon as one operand is float32, else the autocast dtype
+_AUTOCAST_KEEP = "keep"          # the dtypes the operands have
+
+
+def _autocast_cast(value, active: dict, to_float32: bool):
+    """`value` as autocast hands it to an operation. A floating point tensor on a device type
+    with autocast enabled is cast to that device type's autocast dtype, or to float32; float64,
+    integer and other-device tensors are not touched. Lists and tuples of tensors are followed."""
+    if isinstance(value, Tensor):
+        dt = value.dtype
+        if not dt.is_floating_point or dt == _dt.float64:
+            return value
+        target = active.get(value.device.type)
+        if target is None:
+            return value
+        if to_float32:
+            target = _dt.float32
+        return value if dt == target else value.to(target)
+    if type(value) in (list, tuple):
+        if any(isinstance(v, Tensor) for v in value):
+            return type(value)(_autocast_cast(v, active, to_float32) for v in value)
+    return value
+
+
+def _autocast_has_float32(values, active: dict) -> bool:
+    for v in values:
+        if isinstance(v, Tensor):
+            if v.dtype == _dt.float32 and v.device.type in active:
+                return True
+        elif type(v) in (list, tuple) and _autocast_has_float32(v, active):
+            return True
+    return False
+
+
+def _autocast_lower(*tensors) -> tuple:
+    """The operands of an operation autocast runs in the autocast dtype (matmul, linear, conv)."""
+    active = _autocast_active()
+    if not active:
+        return tensors
+    return tuple(_autocast_cast(x, active, False) for x in tensors)
+
+
+def _autocast_float32(*tensors) -> tuple:
+    """The operands of an operation autocast runs in float32 (softmax, norms, losses, sums)."""
+    active = _autocast_active()
+    if not active:
+        return tensors
+    return tuple(_autocast_cast(x, active, True) for x in tensors)
+
+
+def _autocast_op(policy: str):
+    """Decorator for an operation that takes tensors as arguments: inside an autocast block the
+    tensor arguments are cast as `policy` says and the body runs with autocast suspended.
+    A call that names its result (`out=`) or its type (`dtype=`) is not autocast."""
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            active = _autocast_active()
+            if not active:
+                return fn(*args, **kwargs)
+            if policy != _AUTOCAST_KEEP and kwargs.get("out") is None and kwargs.get("dtype") is None:
+                to_float32 = policy == _AUTOCAST_FLOAT32 or (
+                    policy == _AUTOCAST_PROMOTE and _autocast_has_float32(args + tuple(kwargs.values()), active)
+                )
+                args = tuple(_autocast_cast(a, active, to_float32) for a in args)
+                kwargs = {k: _autocast_cast(v, active, to_float32) for k, v in kwargs.items()}
+            with _autocast_suspended():
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+def _autocast_float32_method(method):
+    """A one-tensor method autocast runs in float32 (exp, log, reciprocal, ...)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        active = _autocast_active()
+        if active:
+            self = _autocast_cast(self, active, True)
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _is_bool_scalar(x) -> bool:
+    if type(x) is bool:
+        return True
+    np = _numpy()
+    return np is not None and isinstance(x, np.bool_)
+
+
+def _is_scalar(x) -> bool:
+    """A real number or a bool, Python or NumPy."""
+    return _is_real_number(x) or _is_bool_scalar(x)
+
+
+def _tensor_from_ndarray(arr, device=None) -> Tensor:
+    """A tensor holding a copy of `arr` - any strides, any byte order - with the same dtype."""
+    dt = _dtype_from_numpy(arr.dtype)
+    if not arr.dtype.isnative:
+        arr = arr.astype(arr.dtype.newbyteorder("="))
+    dev = _dev.as_device(device)
+    shape = tuple(int(n) for n in arr.shape)
+    if arr.flags.c_contiguous:
+        data, nbytes = ctypes.c_void_p(arr.ctypes.data), arr.nbytes
+    else:
+        data = arr.tobytes()  # row-major, whatever the strides are
+        nbytes = len(data)
+    ptr = _C.check_ptr(
+        _C.lib.gt_tensor_from_data(len(shape), _c_i64_arr(shape), dt.code, dev.dev_type, dev.index, data, nbytes),
+        "tensor from ndarray",
+    )
+    return Tensor(_ptr=ptr, requires_grad=False)
+
+
+# Arrays whose memory a tensor storage is using (from_numpy), by the token handed to the native
+# side. The native storage can outlive the tensor it was created for - views, saved tensors of
+# the autograd graph - so an array is released when its *storage* is reported gone.
+_SHARED_ARRAYS: dict = {}
+_shared_array_tokens = itertools.count(1)
+
+
+def _release_shared_arrays() -> None:
+    tokens = (ctypes.c_uint64 * 32)()
+    while True:
+        n = int(_C.lib.gt_external_released(tokens, 32))
+        for i in range(n):
+            _SHARED_ARRAYS.pop(int(tokens[i]), None)
+        if n < 32:
+            return
+
+
+def _from_numpy_shared(arr) -> Tensor:
+    """A tensor on the memory of `arr`: nothing is copied and writes show on both sides."""
+    dt = _dtype_from_numpy(arr.dtype)
+    if not arr.dtype.isnative:
+        raise _ArrayLayoutError(
+            "given numpy array has byte order different from the native byte order. "
+            "Conversion between byte orders is currently not supported."
+        )
+    shape = tuple(int(n) for n in arr.shape)
+    if arr.size == 0:
+        # no element to share
+        return _wrap(_C.lib.gt_tensor_empty(len(shape), _c_i64_arr(shape), dt.code, _dev.DEV_CPU, 0), "from_numpy")
+    itemsize = arr.itemsize
+    strides = []
+    for step in arr.strides:
+        if step < 0:
+            raise _ArrayLayoutError(
+                "At least one stride in the given numpy array is negative, and tensors with negative strides "
+                "are not currently supported. (You can probably work around this by making a copy of your "
+                "array with array.copy().)"
+            )
+        if step % itemsize != 0:
+            raise _ArrayLayoutError(
+                "given numpy array strides not a multiple of the element byte size. "
+                "Copy the numpy array to reallocate the memory."
+            )
+        strides.append(step // itemsize)
+    if not arr.flags.aligned:
+        raise _ArrayLayoutError(
+            "given numpy array is not aligned for its element type. Copy the numpy array to reallocate the memory."
+        )
+    if not arr.flags.writeable:
+        warnings.warn(
+            "The given NumPy array is not writable, and tensors do not support non-writable memory. Writing to "
+            "the tensor writes to the underlying (supposedly non-writable) array. Copy the array first "
+            "(array.copy()) to protect its data or to make it writable; the tensor itself is otherwise usable.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if _SHARED_ARRAYS:
+        _release_shared_arrays()
+    token = next(_shared_array_tokens)
+    _SHARED_ARRAYS[token] = arr  # before the native call: from then on the storage relies on the memory
+    ptr = _C.lib.gt_tensor_from_external(len(shape), _c_i64_arr(shape), _c_i64_arr(strides), dt.code, ctypes.c_void_p(arr.ctypes.data), token)
+    if not ptr:
+        del _SHARED_ARRAYS[token]
+        _C.check_ptr(ptr, "from_numpy")
+    return Tensor(_ptr=ptr, requires_grad=False)
+
+
 def _infer_nested_shape_and_flat(obj):
-    if isinstance(obj, Tensor):
-        return obj.shape, obj.tolist(), obj.dtype
-    if not isinstance(obj, (list, tuple)):
-        if isinstance(obj, bool):
-            return (), [obj], _dt.bool
-        if isinstance(obj, int):
-            return (), [obj], _dt.int64
-        if isinstance(obj, complex):
-            return (), [obj], _dt.complex64
-        if isinstance(obj, float):
-            return (), [obj], _dt.get_default_dtype()
-        raise TypeError(f"Unsupported scalar/sequence element type: {type(obj)}")
+    """Shape, values in row-major order and dtype of (nested) Python data.
 
-    if len(obj) == 0:
-        return (0,), [], _dt.get_default_dtype()
+    The leaves of the nesting are Python numbers, tensors, NumPy scalars and arrays, and
+    anything else that offers __array__. Python numbers have the default types - bool, int64,
+    the default floating type - while tensors and NumPy values keep theirs; different leaf
+    types are promoted. Leaves need not be scalars: a list of arrays of one shape stacks them.
+    """
+    default_float = _dt.get_default_dtype()
+    default_complex = _dt.complex128 if default_float == _dt.float64 else _dt.complex64
+    np = _numpy()
+    array_types = (np.ndarray, np.generic) if np is not None else ()
+    flat: list = []
+    found = None  # the promoted dtype of the leaves seen so far
 
-    # Check first element recursively and gather all leaves
-    flat = []
-    sub_shape = None
-    inferred = None
+    def note(dt) -> None:
+        nonlocal found
+        if found is None:
+            found = dt
+        elif found is not dt:
+            found = _dt.promote_types(found, dt)
 
-    def _walk(x, depth: int):
-        nonlocal sub_shape, inferred
-        if isinstance(x, (list, tuple)):
-            if len(x) == 0:
-                return (0,), []
-            sub_res = None
-            out_flat = []
-            for el in x:
-                sh, fl = _walk(el, depth + 1)
-                if sub_res is None:
-                    sub_res = sh
-                elif sub_res != sh:
-                    raise ValueError("Expected all sub-lists to have identical shape")
-                out_flat.extend(fl)
-            return (len(x),) + sub_res, out_flat
+    def array_leaf(arr) -> tuple:
+        note(_dtype_from_numpy(arr.dtype))
+        if arr.ndim == 0:
+            flat.append(arr.item())
         else:
-            _, fl, dt = _infer_nested_shape_and_flat(x)
-            if inferred is None:
-                inferred = dt
-            else:
-                inferred = _dt.promote_types(inferred, dt)
-            return (), fl
+            flat.extend(arr.ravel().tolist())
+        return tuple(int(n) for n in arr.shape)
 
-    shape, flat = _walk(obj, 0)
-    if inferred is None:
-        inferred = _dt.get_default_dtype()
-    elif inferred.is_floating_point:
-        inferred = _dt.get_default_dtype()
-    return shape, flat, inferred
+    def leaf(x) -> tuple:
+        t = type(x)
+        if t is float:
+            flat.append(x)
+            note(default_float)
+            return ()
+        if t is int:
+            flat.append(x)
+            note(_dt.int64)
+            return ()
+        if t is bool:
+            flat.append(x)
+            note(_dt.bool)
+            return ()
+        if isinstance(x, Tensor):
+            note(x.dtype)
+            if x.ndim == 0:
+                flat.append(x.item())
+            elif x.numel() > 0:
+                flat.extend(x.reshape(-1).tolist())
+            return tuple(x.shape)
+        # NumPy values before the Python types: np.float64 is a float, yet keeps its own dtype
+        if array_types and isinstance(x, array_types):
+            return array_leaf(np.asarray(x))
+        if isinstance(x, bool):
+            flat.append(x)
+            note(_dt.bool)
+            return ()
+        if isinstance(x, int):
+            flat.append(int(x))
+            note(_dt.int64)
+            return ()
+        if isinstance(x, float):
+            flat.append(float(x))
+            note(default_float)
+            return ()
+        if isinstance(x, complex):
+            flat.append(complex(x))
+            note(default_complex)
+            return ()
+        if hasattr(x, "__array__") and not isinstance(x, type):
+            import numpy
+
+            arr = numpy.asarray(x)
+            if isinstance(arr, numpy.ndarray):
+                return array_leaf(arr)
+        raise TypeError(f"Unsupported scalar/sequence element type: {type(x)}")
+
+    def walk(x) -> tuple:
+        if isinstance(x, (list, tuple, range)):
+            if len(x) == 0:
+                return (0,)
+            sub = None
+            for el in x:
+                sh = walk(el)
+                if sub is None:
+                    sub = sh
+                elif sub != sh:
+                    raise ValueError("Expected all sub-lists to have identical shape")
+            return (len(x),) + sub
+        return leaf(x)
+
+    shape = walk(obj)
+    return shape, flat, found if found is not None else default_float
 
 
 def _pack_flat_to_bytes(flat: list, dtype: _dt.dtype) -> bytes:
@@ -204,38 +578,15 @@ def _from_python(data, dtype: _dt.dtype | None = None, device=None, requires_gra
             t.requires_grad_(True)
         return t
 
-    # Check numpy ndarray without importing numpy
-    np_mod = sys.modules.get("numpy")
-    if np_mod is not None and isinstance(data, np_mod.ndarray):
-        arr = np_mod.ascontiguousarray(data)
-        np_dt = str(arr.dtype)
-        np_map = {
-            "float32": _dt.float32,
-            "float64": _dt.float64,
-            "float16": _dt.float16,
-            "int64": _dt.int64,
-            "int32": _dt.int32,
-            "int16": _dt.int16,
-            "int8": _dt.int8,
-            "uint8": _dt.uint8,
-            "bool": _dt.bool,
-            "complex64": _dt.complex64,
-            "complex128": _dt.complex128,
-        }
-        src_dt = np_map.get(np_dt)
-        if src_dt is not None:
-            shape = tuple(int(s) for s in arr.shape)
-            raw = arr.tobytes()
-            ptr = _C.check_ptr(
-                _C.lib.gt_tensor_from_data(len(shape), _c_i64_arr(shape), src_dt.code, dev.dev_type, dev.index, raw, len(raw)),
-                "from_numpy",
-            )
-            t = Tensor(_ptr=ptr, requires_grad=False)
-            if dtype is not None and t.dtype != dtype:
-                t = t.to(dtype)
-            if requires_grad:
-                t.requires_grad_(True)
-            return t
+    # A NumPy array or scalar (never importing numpy for it): a copy, with the array's dtype.
+    np_mod = _numpy()
+    if np_mod is not None and isinstance(data, (np_mod.ndarray, np_mod.generic)):
+        t = _tensor_from_ndarray(np_mod.asarray(data), dev)
+        if dtype is not None and t.dtype != _dt.as_dtype(dtype):
+            t = t.to(_dt.as_dtype(dtype))
+        if requires_grad:
+            t.requires_grad_(True)
+        return t
 
     shape, flat, inferred_dt = _infer_nested_shape_and_flat(data)
     target_dt = _dt.as_dtype(dtype) if dtype is not None else inferred_dt
@@ -263,7 +614,93 @@ def _from_python(data, dtype: _dt.dtype | None = None, device=None, requires_gra
 def _ensure_tensor(x, ref: Tensor) -> Tensor:
     if isinstance(x, Tensor):
         return x
+    x = _unwrap_numpy_scalar(x)  # a NumPy scalar is an operand like a Python number
     return _from_python(x, dtype=ref.dtype if isinstance(x, float) else None, device=ref.device)
+
+
+def _index_list_to_tensor(items: list, device) -> Tensor:
+    """A list used as an index: all bools -> a boolean mask, otherwise integer indices."""
+    flat = []
+
+    def walk(x):
+        if isinstance(x, (list, tuple)):
+            for y in x:
+                walk(y)
+        else:
+            flat.append(x)
+
+    walk(items)
+    if flat and all(isinstance(x, bool) for x in flat):
+        return _from_python(items, dtype=_dt.bool, device=device)
+    if any(isinstance(x, float) for x in flat):
+        raise IndexError("a list used as an index must hold integers or booleans, not floats")
+    return _from_python(items, dtype=_dt.int64, device=device)
+
+
+def _normalize_index(idx, device):
+    """`idx` with every entry in the form the indexing code works on: ints, slices, None,
+    Ellipsis, lists and tensors. NumPy integers - anything with __index__ - become ints,
+    NumPy arrays become index tensors, a tuple inside the index is a list of indices."""
+    kind = type(idx)
+    if kind is int or kind is slice or idx is None or idx is Ellipsis:
+        return idx
+
+    def entry(it):
+        t = type(it)
+        if it is None or it is Ellipsis or t is int or t is slice or t is list or t is bool or isinstance(it, Tensor):
+            return it
+        np = _numpy()
+        if np is not None:
+            if isinstance(it, np.ndarray):
+                if it.dtype.kind in "iu" and it.dtype.name not in _NUMPY_DTYPE_NAMES:
+                    it = it.astype(np.int64)  # an index of any integer type is an index
+                elif it.dtype.kind not in "iub":
+                    raise IndexError("arrays used as indices must be of integer or boolean type")
+                return _tensor_from_ndarray(it, device)
+            if isinstance(it, np.bool_):
+                return bool(it)
+        if t is tuple:
+            return list(it)
+        if isinstance(it, (int, slice, list)):
+            return it
+        try:
+            return operator.index(it)
+        except TypeError:
+            return it  # reported by the indexing code, with the list of what is valid
+
+    if kind is tuple:
+        return tuple(entry(it) for it in idx)
+    return entry(idx)
+
+
+def _advanced_result_shape(shape: tuple[int, ...], dims: list[int], index_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+    """Shape of x[..., i0, i1, ...]: the broadcast index shape replaces the indexed dimensions
+    when they are next to each other and comes first when they are not (numpy/torch rule)."""
+    idx_shape: tuple[int, ...] = ()
+    for sh in index_shapes:
+        out = []
+        for i in range(1, max(len(idx_shape), len(sh)) + 1):
+            da = idx_shape[-i] if i <= len(idx_shape) else 1
+            db = sh[-i] if i <= len(sh) else 1
+            if da != db and da != 1 and db != 1:
+                raise IndexError("shape mismatch: indexing tensors could not be broadcast together")
+            out.append(db if da == 1 else da)
+        idx_shape = tuple(reversed(out))
+    rest = [shape[d] for d in range(len(shape)) if d not in dims]
+    if dims[-1] - dims[0] + 1 == len(dims):
+        return tuple(shape[: dims[0]]) + idx_shape + tuple(shape[dims[-1] + 1 :])
+    return idx_shape + tuple(rest)
+
+
+def _broadcast_value(value: Tensor, shape: tuple[int, ...]) -> Tensor:
+    """`value` expanded to the shape an assignment writes, or a clear error."""
+    vs = value.shape
+    ok = len(vs) <= len(shape) and all(v == 1 or v == s for v, s in zip(reversed(vs), reversed(shape)))
+    if not ok:
+        raise RuntimeError(
+            f"shape mismatch: value tensor of shape {list(vs)} cannot be broadcast to indexing result of shape {list(shape)}"
+        )
+    return value.expand(shape)
 
 
 def _format_tensor_str(t: Tensor) -> str:
@@ -366,11 +803,67 @@ class Tensor:
         if requires_grad:
             self.requires_grad_(True)
 
+    # ---------- copy / pickle ----------
+    # A Tensor owns a native handle. The default copy and pickle protocols duplicate the Python
+    # attributes, handle included: two objects then free the same native tensor (a double free,
+    # or a crash when one of them is used after the other is gone).
+
+    def _shell(self) -> Tensor:
+        """A new object of the same class with the Python-side attributes of this one and no data."""
+        new = type(self).__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        new._ptr = 0
+        new._grad = None
+        new._grad_fn = None
+        new._hooks = {}
+        new._next_hook_id = 0
+        return new
+
+    def __copy__(self) -> Tensor:
+        """Shallow copy: another tensor object on the same data."""
+        new = self._shell()
+        new._ptr = _C.check_ptr(
+            _C.lib.gt_tensor_view(self._ptr, self.ndim, _c_i64_arr(self.shape), _c_i64_arr(self.stride()), self.storage_offset()),
+            "copy",
+        )
+        new._grad = self._grad
+        new._grad_fn = self._grad_fn
+        new._hooks = dict(self._hooks)
+        new._next_hook_id = self._next_hook_id
+        return new
+
+    def __deepcopy__(self, memo) -> Tensor:
+        hit = memo.get(id(self))
+        if hit is not None:
+            return hit
+        if self._grad_fn is not None:
+            raise RuntimeError(
+                "Only Tensors created explicitly by the user (graph leaves) support the deepcopy protocol at the moment"
+            )
+        import copy as _copy
+
+        with _autograd_state.no_grad():
+            data = self.clone()
+        new = self._shell()
+        new._ptr, data._ptr = data._ptr, 0
+        memo[id(self)] = new
+        if self._grad is not None:
+            new._grad = _copy.deepcopy(self._grad, memo)
+        return new
+
+    def __reduce_ex__(self, protocol):
+        from .serialization import _restore_pickled, _to_serializable
+
+        return (_restore_pickled, (_to_serializable(self),))
+
     def __del__(self):
         ptr = getattr(self, "_ptr", 0)
         if ptr and _C is not None and getattr(_C, "lib", None) is not None:
             _C.lib.gt_tensor_free(ptr)
             self._ptr = 0
+            # that may have been the last user of memory borrowed from a NumPy array
+            if _SHARED_ARRAYS and _release_shared_arrays is not None:
+                _release_shared_arrays()
 
     # ---------- Metadata Properties ----------
 
@@ -563,6 +1056,27 @@ class Tensor:
         with _autograd_state.no_grad():
             self.copy_(other)
 
+    def _rebind(self, other: Tensor) -> None:
+        """Make this object refer to the data of `other`: its storage, shape, dtype and device.
+
+        The Python object stays the one it was, with its requires_grad flag, its .grad and its
+        hooks - which is what lets nn.Module.to()/half()/cuda() convert a Parameter without
+        replacing it: modules sharing the Parameter keep sharing it, and an optimizer created
+        before the conversion keeps updating the parameter the model uses.
+        """
+        ptr = _C.check_ptr(
+            _C.lib.gt_tensor_view(other._ptr, other.ndim, _c_i64_arr(other.shape), _c_i64_arr(other.stride()), other.storage_offset()),
+            "rebind",
+        )
+        old, self._ptr = self._ptr, ptr
+        if old:
+            _C.lib.gt_tensor_free(old)
+            if _SHARED_ARRAYS:
+                _release_shared_arrays()
+        self._version += 1
+        if self._requires_grad and not (self.dtype.is_floating_point or self.dtype.is_complex):
+            self._requires_grad = False
+
     def backward(self, gradient=None, retain_graph: bool | None = None, create_graph: bool = False, inputs=None) -> None:
         _autograd_backward(self, gradient, retain_graph=retain_graph, create_graph=create_graph, inputs=inputs)
 
@@ -713,36 +1227,114 @@ class Tensor:
         return _flat_to_nested(flat, sh)
 
     def numpy(self, *, force: bool = False):
+        """This tensor as a NumPy array on the same memory: a write through either shows in both.
+
+        Nothing is copied, whatever the strides of the tensor, and the array keeps the memory
+        alive for as long as it or one of its views exists. ``force=True`` gives the sharing up
+        where it has to: it detaches a tensor that requires grad, copies one from another
+        device, and converts bfloat16 and quantized data - which NumPy cannot hold - to float32.
+        """
         import numpy as np
 
-        if not force and self.requires_grad:
-            raise RuntimeError("Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.")
-        if not force and self.device.type != "cpu":
-            raise TypeError("can't convert non-CPU tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.")
-        src = self
+        dt = self.dtype
+        foreign = dt == _dt.bfloat16 or dt.is_quantized
+        if not force:
+            if self.requires_grad:
+                raise RuntimeError("Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.")
+            if self.device.type != "cpu":
+                raise TypeError(
+                    f"can't convert {self.device} device type tensor to numpy. "
+                    "Use Tensor.cpu() to copy the tensor to host memory first."
+                )
+            if foreign:
+                raise TypeError(
+                    f"Got unsupported ScalarType {dt.name}: NumPy has no such type. Convert the tensor first "
+                    "(for example with .float()), or pass force=True for a float32 copy."
+                )
+        # A handle of its own on the storage: the array stays valid whatever happens to `self`.
+        src = self.detach()
         if src.device.type != "cpu":
-            src = src.cpu()
-        if src.dtype == _dt.bfloat16 or src.dtype.is_quantized:
-            src = src.to(_dt.float32)
-        if not src.is_contiguous() or src.storage_offset() != 0:
-            src = src.contiguous()
-        np_map = {
-            _dt.float32: np.float32,
-            _dt.float64: np.float64,
-            _dt.float16: np.float16,
-            _dt.int64: np.int64,
-            _dt.int32: np.int32,
-            _dt.int16: np.int16,
-            _dt.int8: np.int8,
-            _dt.uint8: np.uint8,
-            _dt.bool: np.bool_,
-            _dt.complex64: np.complex64,
-            _dt.complex128: np.complex128,
-        }
-        arr = np.empty(tuple(src.shape), dtype=np_map[src.dtype])
-        if src.numel() > 0:
-            _C.check_rc(_C.lib.gt_tensor_copy_to_host(src._ptr, arr.ctypes.data, arr.nbytes), "numpy")
-        return arr
+            src = _wrap(_C.lib.gt_tensor_to_device(src._ptr, _dev.DEV_CPU, 0), "numpy")
+        if foreign:
+            src = _wrap(_C.lib.gt_tensor_to_dtype(src._ptr, _dt.float32.code), "numpy")
+
+        np_dtype = np.dtype(_NUMPY_NAME_OF_DTYPE[src.dtype])
+        shape = tuple(src.shape)
+        if src.numel() == 0:
+            return np.empty(shape, dtype=np_dtype)
+        base = int(_C.lib.gt_tensor_storage_host_ptr(src._ptr))
+        nbytes = int(_C.lib.gt_tensor_storage_nbytes(src._ptr))
+        if not base or not nbytes:
+            raise RuntimeError(f"numpy(): a tensor on device {src.device} has no host memory")
+        itemsize = np_dtype.itemsize
+        # The whole storage as a buffer; NumPy checks that the view stays inside it. The buffer
+        # is the array's base object, and what it holds on to is what the array keeps alive.
+        memory = (ctypes.c_char * nbytes).from_address(base)
+        memory._storage = src
+        return np.ndarray(
+            shape,
+            dtype=np_dtype,
+            buffer=memory,
+            offset=src.storage_offset() * itemsize,
+            strides=tuple(step * itemsize for step in src.stride()),
+        )
+
+    def __array__(self, dtype=None, copy=None):
+        """np.asarray(t), np.array(t): the same array as numpy() - shared memory - converted
+        or copied only when `dtype` or `copy` ask for it."""
+        arr = self.numpy()
+        if dtype is not None:
+            np = sys.modules["numpy"]
+            if arr.dtype != np.dtype(dtype):
+                if copy is False:
+                    raise ValueError(
+                        f"Unable to avoid copy while creating an array as requested: the tensor holds {arr.dtype}, not {np.dtype(dtype)}."
+                    )
+                return arr.astype(dtype)
+        return arr.copy() if copy else arr
+
+    def __array_ufunc__(self, ufunc, method, *inputs, out=None, **kwargs):
+        """NumPy ufuncs with a tensor among their operands: np.sin(t), ndarray + t, ndarray @ t.
+
+        Where the ufunc has a tensor counterpart, that computes the result - so it follows the
+        dtype rules of tensors, stays on the tensor's device and, for a tensor that requires
+        grad, in the autograd graph. Every other call (a ufunc without counterpart, ``out=``,
+        ``where=``, ``reduce`` and friends) is computed by NumPy on the tensors' memory, which
+        has the limits of numpy(): CPU tensors that do not require grad. Results are tensors,
+        except for arrays passed as ``out``.
+        """
+        if method == "__call__" and out is None and not kwargs:
+            fn = _UFUNC_TENSOR_OPS.get(ufunc.__name__)
+            if fn is not None:
+                operands = [_ufunc_operand(x, self) for x in inputs]
+                if not any(x is NotImplemented for x in operands):
+                    return fn(*operands)
+
+        def host(x):
+            return x.numpy() if isinstance(x, Tensor) else x
+
+        args = [host(x) for x in inputs]
+        outs = None
+        if out is not None:
+            outs = out if isinstance(out, tuple) else (out,)
+            for o in outs:
+                if isinstance(o, Tensor):
+                    o._check_inplace()
+            kwargs["out"] = tuple(host(o) for o in outs)
+        if method == "at" and isinstance(inputs[0], Tensor):
+            inputs[0]._check_inplace()  # ufunc.at writes into its first operand
+        result = getattr(ufunc, method)(*args, **kwargs)
+        if outs is not None:
+            return outs if len(outs) > 1 else outs[0]
+
+        np = sys.modules["numpy"]
+
+        def wrap(r):
+            if isinstance(r, (np.ndarray, np.generic)) and r.dtype.name in _NUMPY_DTYPE_NAMES:
+                return _tensor_from_ndarray(np.asarray(r), self.device)
+            return r
+
+        return tuple(wrap(r) for r in result) if isinstance(result, tuple) else wrap(result)
 
     # ---------- Python Protocols ----------
 
@@ -794,7 +1386,8 @@ class Tensor:
         n_ell = sum(1 for item in idx if item is Ellipsis)
         if n_ell > 1:
             raise IndexError("an index can only have a single ellipsis ('...')")
-        n_consuming = sum(1 for item in idx if item is not None and item is not Ellipsis)
+        # None, True and False add a dimension; everything else uses one up
+        n_consuming = sum(1 for item in idx if item is not None and item is not Ellipsis and type(item) is not bool)
         if n_consuming > self.ndim:
             raise IndexError(f"too many indices for tensor of dimension {self.ndim}")
 
@@ -804,7 +1397,7 @@ class Tensor:
                 expanded.extend([slice(None)] * (self.ndim - n_consuming))
             else:
                 expanded.append(item)
-        while sum(1 for item in expanded if item is not None) < self.ndim:
+        while sum(1 for item in expanded if item is not None and type(item) is not bool) < self.ndim:
             expanded.append(slice(None))
 
         cur_shape = self.shape
@@ -817,6 +1410,11 @@ class Tensor:
         for item in expanded:
             if item is None:
                 new_shape.append(1)
+                new_strides.append(0)
+            elif type(item) is bool:
+                # a 0-d boolean mask (numpy, torch): True keeps everything in a new dimension of
+                # size 1, False selects nothing. Not the integers 1 and 0.
+                new_shape.append(1 if item else 0)
                 new_strides.append(0)
             elif isinstance(item, int):
                 sz = cur_shape[dim_i]
@@ -843,10 +1441,106 @@ class Tensor:
 
         return tuple(new_shape), tuple(new_strides), int(offset)
 
+    def _split_advanced_index(self, idx):
+        """Split an index that contains tensors or lists into a basic part and index tensors.
+
+        Returns ``(basic, dims, tensors)``. ``basic`` (ints, slices, None; every advanced
+        entry replaced by full slices) is applied first and yields a view; ``tensors[i]``
+        then indexes dimension ``dims[i]`` of that view. ``basic`` is None when it would
+        select everything. A boolean mask stands for the coordinates of its True elements,
+        one integer tensor per dimension it covers, and must match those dimensions exactly.
+        """
+        items = list(idx) if isinstance(idx, tuple) else [idx]
+        if sum(1 for it in items if it is Ellipsis) > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+
+        for i, it in enumerate(items):
+            if isinstance(it, bool):
+                raise IndexError("a bare True/False is not supported as an index; use a boolean tensor")
+            if isinstance(it, list):
+                items[i] = _index_list_to_tensor(it, self.device)
+            elif isinstance(it, Tensor):
+                if it.dtype != _dt.bool and (it.dtype.is_floating_point or it.dtype.is_complex):
+                    raise IndexError("tensors used as indices must be integer or boolean tensors")
+                if it.dtype == _dt.bool and it.ndim == 0:
+                    raise IndexError("0-dimensional boolean index tensors are not supported")
+            elif not (it is None or it is Ellipsis or isinstance(it, (int, slice))):
+                raise IndexError(
+                    f"only integers, slices, ellipsis, None and integer or boolean tensors are valid indices (got {type(it).__name__})"
+                )
+
+        def consumed(it) -> int:
+            if it is None or it is Ellipsis:
+                return 0
+            return it.ndim if isinstance(it, Tensor) and it.dtype == _dt.bool else 1
+
+        n_consumed = sum(consumed(it) for it in items)
+        if n_consumed > self.ndim:
+            raise IndexError(f"too many indices for tensor of dimension {self.ndim}")
+        expanded = []
+        for it in items:
+            if it is Ellipsis:
+                expanded.extend([slice(None)] * (self.ndim - n_consumed))
+            else:
+                expanded.append(it)
+
+        # NumPy/PyTorch rule: once an index holds an array, its integers are array indices as
+        # well (0-d ones). That changes the result only when the array indices are not all
+        # next to each other - the indexed dimensions then come first - so only then are the
+        # integers turned into index tensors. Otherwise taking them first, as part of the view,
+        # gives the same result for less work.
+        advanced = [k for k, it in enumerate(expanded) if isinstance(it, (int, Tensor))]
+        if (
+            advanced
+            and advanced[-1] - advanced[0] + 1 != len(advanced)
+            and any(isinstance(expanded[k], int) for k in advanced)
+            and any(isinstance(expanded[k], Tensor) for k in advanced)
+        ):
+            expanded = [
+                _from_python(it, dtype=_dt.int64, device=self.device) if isinstance(it, int) else it for it in expanded
+            ]
+
+        basic, dims, tensors = [], [], []
+        src_dim = 0   # dimension of self the next entry applies to
+        view_dim = 0  # the same position in the view that `basic` produces
+        for it in expanded:
+            if it is None:
+                basic.append(None)
+                view_dim += 1
+            elif isinstance(it, int):
+                basic.append(it)
+                src_dim += 1
+            elif isinstance(it, slice):
+                basic.append(it)
+                src_dim += 1
+                view_dim += 1
+            elif it.dtype == _dt.bool:
+                for k in range(it.ndim):
+                    if it.shape[k] != self.shape[src_dim + k]:
+                        raise IndexError(
+                            f"The shape of the mask {list(it.shape)} at index {k} does not match the shape of the "
+                            f"indexed tensor {list(self.shape)} at index {src_dim + k}"
+                        )
+                for k, coord in enumerate(it.nonzero(as_tuple=True)):
+                    basic.append(slice(None))
+                    dims.append(view_dim + k)
+                    tensors.append(coord)
+                src_dim += it.ndim
+                view_dim += it.ndim
+            else:
+                basic.append(slice(None))
+                dims.append(view_dim)
+                tensors.append(it)
+                src_dim += 1
+                view_dim += 1
+        trivial = all(isinstance(b, slice) and b == slice(None) for b in basic)
+        return (None if trivial else tuple(basic)), dims, tensors
+
     def __getitem__(self, idx):
-        # Single boolean mask tensor
-        if isinstance(idx, Tensor) and idx.dtype == _dt.bool:
-            return _wrap(_C.lib.gt_masked_select(self._ptr, idx._ptr), "masked_select")
+        idx = _normalize_index(idx, self.device)
+        # A boolean mask of the tensor's own shape: one pass in C
+        if isinstance(idx, Tensor) and idx.dtype == _dt.bool and idx.ndim > 0 and idx.shape == self.shape:
+            return MaskedSelectFn.apply(self, idx)
 
         parsed = self._parse_view_index(idx)
         if parsed is not None:
@@ -881,62 +1575,25 @@ class Tensor:
                     dim_i += 1
             return res[tuple(new_idx)]
 
-        # Advanced indexing with Tensor / list
-        n_ell = sum(1 for it in idx_tup if it is Ellipsis)
-        n_cons = sum(1 for it in idx_tup if it is not None and it is not Ellipsis)
-        expanded = []
-        for it in idx_tup:
-            if it is Ellipsis:
-                expanded.extend([slice(None)] * (self.ndim - n_cons))
-            else:
-                expanded.append(it)
-        while sum(1 for it in expanded if it is not None) < self.ndim:
-            expanded.append(slice(None))
-
-        # First handle pure slices/ints via view, then gt_index_tensor on remaining tensor indices
-        t_ptrs = []
-        t_dims = []
-        pre_slices = []
-        dim_i = 0
-        for it in expanded:
-            if isinstance(it, slice):
-                pre_slices.append(it)
-                dim_i += 1
-            elif isinstance(it, int):
-                pre_slices.append(it)
-            elif isinstance(it, (Tensor, list)):
-                pre_slices.append(slice(None))
-                t_idx = it if isinstance(it, Tensor) else _from_python(it, dtype=_dt.int64, device=self.device)
-                t_ptrs.append(t_idx)
-                t_dims.append(dim_i)
-                dim_i += 1
-            elif it is None:
-                pre_slices.append(None)
-                dim_i += 1
-
-        base = self[tuple(pre_slices)] if any(not (isinstance(x, slice) and x == slice(None)) for x in pre_slices) else self
-        if not t_ptrs:
+        # Advanced indexing with tensors, lists and boolean masks: slices and ints first, as a
+        # view, then the index tensors - through a Function, so gradients flow back.
+        basic, dims, tensors = self._split_advanced_index(idx)
+        base = self[basic] if basic is not None else self
+        if not tensors:
             return base
-        ptrs_arr = (ctypes.c_void_p * len(t_ptrs))(*[t._ptr for t in t_ptrs])
-        dims_arr = _c_i32_arr(t_dims)
-        return _wrap(_C.lib.gt_index_tensor(base._ptr, len(t_ptrs), ptrs_arr, dims_arr), "index")
+        return IndexTensorFn.apply(base, tuple(dims), *tensors)
 
     def __setitem__(self, idx, value):
+        # Writes into the tensor's storage: refused for a leaf that requires grad (as every
+        # other in-place operation is), and the version counter moves on.
+        self._check_inplace()
+        idx = _normalize_index(idx, self.device)
         val_t = _ensure_tensor(value, self)
         if val_t.dtype != self.dtype:
             val_t = val_t.to(self.dtype)
 
-        if isinstance(idx, Tensor) and idx.dtype == _dt.bool:
-            if val_t.numel() == 1:
-                _C.check_rc(_C.lib.gt_masked_fill_inplace(self._ptr, idx._ptr, float(val_t.item())), "setitem mask")
-            else:
-                # Scatter/assign masked elements
-                indices = idx.nonzero()
-                ptrs = [indices[:, d] for d in range(indices.shape[1])]
-                dims = list(range(indices.shape[1]))
-                p_arr = (ctypes.c_void_p * len(ptrs))(*[t._ptr for t in ptrs])
-                _C.check_rc(_C.lib.gt_index_put(self._ptr, len(ptrs), p_arr, _c_i32_arr(dims), val_t._ptr, 0), "setitem mask tensor")
-            self._version += 1
+        if isinstance(idx, Tensor) and idx.dtype == _dt.bool and idx.ndim > 0 and idx.shape == self.shape and val_t.numel() == 1:
+            _C.check_rc(_C.lib.gt_masked_fill_inplace(self._ptr, idx._ptr, float(val_t.item())), "setitem mask")
             return
 
         parsed = self._parse_view_index(idx)
@@ -944,32 +1601,41 @@ class Tensor:
             new_shape, new_strides, offset = parsed
             v = Tensor(_ptr=_C.check_ptr(_C.lib.gt_tensor_view(self._ptr, len(new_shape), _c_i64_arr(new_shape), _c_i64_arr(new_strides), offset)))
             if val_t.shape != v.shape:
-                val_t = val_t.expand(v.shape)
+                val_t = _broadcast_value(val_t, v.shape)
             _C.check_rc(_C.lib.gt_tensor_copy_inplace(v._ptr, val_t._ptr), "setitem copy")
-            self._version += 1
             return
 
-        idx_tup = idx if isinstance(idx, tuple) else (idx,)
-        t_ptrs = []
-        t_dims = []
-        for d, it in enumerate(idx_tup):
-            if isinstance(it, (Tensor, list)):
-                t_idx = it if isinstance(it, Tensor) else _from_python(it, dtype=_dt.int64, device=self.device)
-                t_ptrs.append(t_idx)
-                t_dims.append(d)
-        if t_ptrs:
-            p_arr = (ctypes.c_void_p * len(t_ptrs))(*[t._ptr for t in t_ptrs])
-            _C.check_rc(_C.lib.gt_index_put(self._ptr, len(t_ptrs), p_arr, _c_i32_arr(t_dims), val_t._ptr, 0), "index_put")
-            self._version += 1
-            return
-        raise IndexError(f"Unsupported __setitem__ index: {idx}")
+        basic, dims, tensors = self._split_advanced_index(idx)
+        if not tensors:
+            raise IndexError(f"Unsupported __setitem__ index: {idx}")
+        target = self
+        if basic is not None:
+            # ints and slices select a view of this tensor; the index tensors then write into it
+            view = self._parse_view_index(basic)
+            if view is None:
+                raise IndexError("a slice with a negative step cannot be combined with tensor indices in an assignment")
+            new_shape, new_strides, offset = view
+            target = Tensor(_ptr=_C.check_ptr(_C.lib.gt_tensor_view(self._ptr, len(new_shape), _c_i64_arr(new_shape), _c_i64_arr(new_strides), offset)))
+        result_shape = _advanced_result_shape(target.shape, dims, [ti.shape for ti in tensors])
+        if val_t.shape != result_shape:
+            val_t = _broadcast_value(val_t, result_shape)
+        p_arr = (ctypes.c_void_p * len(tensors))(*[ti._ptr for ti in tensors])
+        _C.check_rc(_C.lib.gt_index_put(target._ptr, len(tensors), p_arr, _c_i32_arr(dims), val_t._ptr, 0), "index_put")
 
     # ---------- Shape / View / Splitting ----------
 
     def view(self, *shape) -> Tensor:
+        """The same elements seen in another shape - always sharing memory with `self`, never a
+        copy. When the strides of `self` do not allow that (after a transpose, say), view()
+        raises; reshape() is the method that copies when it has to."""
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
         sh = self._resolve_neg1_shape(shape)
+        if _can_view_reshape(self.shape, self.stride(), sh) is None:
+            raise RuntimeError(
+                "view size is not compatible with input tensor's size and stride (at least one dimension "
+                "spans across two contiguous subspaces). Use .reshape(...) instead."
+            )
         return ReshapeFn.apply(self, sh)
 
     def view_as(self, other: Tensor) -> Tensor:
@@ -1001,9 +1667,20 @@ class Tensor:
             else:
                 known *= s
         if neg_idx != -1:
-            if known == 0 or n % known != 0:
-                raise RuntimeError(f"shape '{shape}' is invalid for input of size {n}")
+            if known == 0:
+                if n != 0:
+                    raise RuntimeError(f"shape '{list(shape)}' is invalid for input of size {n}")
+                raise RuntimeError(
+                    f"cannot reshape tensor of 0 elements into shape {list(shape)} because the unspecified "
+                    "dimension size -1 can be any value and is ambiguous"
+                )
+            if n % known != 0:
+                raise RuntimeError(f"shape '{list(shape)}' is invalid for input of size {n}")
             out[neg_idx] = n // known
+        elif known != n:
+            # without this a view of the wrong size was handed out: fewer elements than the
+            # tensor has, or more - reaching past the end of its memory
+            raise RuntimeError(f"shape '{list(shape)}' is invalid for input of size {n}")
         return tuple(out)
 
     def flatten(self, start_dim: int = 0, end_dim: int = -1) -> Tensor:
@@ -1029,7 +1706,7 @@ class Tensor:
         if dim is None:
             new_sh = tuple(s for s in sh if s != 1)
             return self.reshape(new_sh) if new_sh != sh else self.view(sh)
-        dims = (dim,) if isinstance(dim, int) else tuple(dim)
+        dims = _dims_tuple(dim)
         norm = {d if d >= 0 else d + self.ndim for d in dims}
         new_sh = tuple(s for i, s in enumerate(sh) if not (i in norm and s == 1))
         return self.reshape(new_sh)
@@ -1075,9 +1752,9 @@ class Tensor:
         return PermuteFn.apply(self, tuple(dims))
 
     def movedim(self, source, destination) -> Tensor:
-        if isinstance(source, int):
+        if _is_int(source):
             source = (source,)
-        if isinstance(destination, int):
+        if _is_int(destination):
             destination = (destination,)
         nd = self.ndim
         src = [s if s >= 0 else s + nd for s in source]
@@ -1136,7 +1813,7 @@ class Tensor:
     def split(self, split_size_or_sections, dim: int = 0):
         d = dim if dim >= 0 else dim + self.ndim
         total = self.shape[d]
-        if isinstance(split_size_or_sections, int):
+        if _is_int(split_size_or_sections):
             step = split_size_or_sections
             sizes = [step] * (total // step)
             if total % step:
@@ -1159,7 +1836,7 @@ class Tensor:
     def tensor_split(self, indices_or_sections, dim: int = 0):
         d = dim if dim >= 0 else dim + self.ndim
         total = self.shape[d]
-        if isinstance(indices_or_sections, int):
+        if _is_int(indices_or_sections):
             n = indices_or_sections
             q, r = divmod(total, n)
             sizes = [q + (1 if i < r else 0) for i in range(n)]
@@ -1174,19 +1851,19 @@ class Tensor:
     # ---------- Operators & Math ----------
 
     def add(self, other, *, alpha: float = 1.0) -> Tensor:
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             if alpha == 1.0:
                 return BinaryScalarFn.apply(self, float(other), _C.BIN_ADD, 0)
             return BinaryScalarFn.apply(self, float(other) * alpha, _C.BIN_ADD, 0)
         return AddFn.apply(self, _ensure_tensor(other, self), float(alpha))
 
     def sub(self, other, *, alpha: float = 1.0) -> Tensor:
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return BinaryScalarFn.apply(self, float(other) * alpha, _C.BIN_SUB, 0)
         return SubFn.apply(self, _ensure_tensor(other, self), float(alpha))
 
     def mul(self, other) -> Tensor:
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return BinaryScalarFn.apply(self, float(other), _C.BIN_MUL, 0)
         return MulFn.apply(self, _ensure_tensor(other, self))
 
@@ -1196,7 +1873,7 @@ class Tensor:
         if rounding_mode == "trunc":
             q = self / other
             return q.trunc()
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return BinaryScalarFn.apply(self, float(other), _C.BIN_DIV, 0)
         return DivFn.apply(self, _ensure_tensor(other, self))
 
@@ -1207,9 +1884,11 @@ class Tensor:
         return self // other
 
     def pow(self, exponent) -> Tensor:
-        if isinstance(exponent, (int, float)) and not isinstance(exponent, bool):
+        (self,) = _autocast_float32(self)
+        if _is_real_number(exponent):
             return BinaryScalarFn.apply(self, float(exponent), _C.BIN_POW, 0)
-        return PowFn.apply(self, _ensure_tensor(exponent, self))
+        (exponent,) = _autocast_float32(_ensure_tensor(exponent, self))
+        return PowFn.apply(self, exponent)
 
     def __add__(self, other):
         return self.add(other)
@@ -1221,7 +1900,7 @@ class Tensor:
         return self.sub(other)
 
     def __rsub__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return BinaryScalarFn.apply(self, float(other), _C.BIN_SUB, 1)
         return SubFn.apply(_ensure_tensor(other, self), self, 1.0)
 
@@ -1235,27 +1914,27 @@ class Tensor:
         return self.div(other)
 
     def __rtruediv__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return BinaryScalarFn.apply(self, float(other), _C.BIN_DIV, 1)
         return DivFn.apply(_ensure_tensor(other, self), self)
 
     def __floordiv__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return _wrap(_C.lib.gt_binary_scalar_op(self._ptr, float(other), 0, _C.BIN_FLOOR_DIV))
         return _wrap(_C.lib.gt_binary_op(self._ptr, _ensure_tensor(other, self)._ptr, _C.BIN_FLOOR_DIV, 1.0))
 
     def __rfloordiv__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return _wrap(_C.lib.gt_binary_scalar_op(self._ptr, float(other), 1, _C.BIN_FLOOR_DIV))
         return _wrap(_C.lib.gt_binary_op(_ensure_tensor(other, self)._ptr, self._ptr, _C.BIN_FLOOR_DIV, 1.0))
 
     def __mod__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return _wrap(_C.lib.gt_binary_scalar_op(self._ptr, float(other), 0, _C.BIN_REMAINDER))
         return _wrap(_C.lib.gt_binary_op(self._ptr, _ensure_tensor(other, self)._ptr, _C.BIN_REMAINDER, 1.0))
 
     def __rmod__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        if _is_real_number(other):
             return _wrap(_C.lib.gt_binary_scalar_op(self._ptr, float(other), 1, _C.BIN_REMAINDER))
         return _wrap(_C.lib.gt_binary_op(_ensure_tensor(other, self)._ptr, self._ptr, _C.BIN_REMAINDER, 1.0))
 
@@ -1263,9 +1942,11 @@ class Tensor:
         return self.pow(other)
 
     def __rpow__(self, other):
-        if isinstance(other, (int, float)) and not isinstance(other, bool):
+        (self,) = _autocast_float32(self)
+        if _is_real_number(other):
             return BinaryScalarFn.apply(self, float(other), _C.BIN_POW, 1)
-        return PowFn.apply(_ensure_tensor(other, self), self)
+        (other,) = _autocast_float32(_ensure_tensor(other, self))
+        return PowFn.apply(other, self)
 
     def __neg__(self):
         return self.neg()
@@ -1287,7 +1968,7 @@ class Tensor:
         return _wrap(_C.lib.gt_unary_op(self._ptr, op, 0.0, 0.0))
 
     def _cmp_op(self, other, code: int) -> Tensor:
-        if isinstance(other, (int, float, bool)):
+        if _is_scalar(other):
             return _wrap(_C.lib.gt_binary_scalar_op(self._ptr, float(other), 0, code))
         return _wrap(_C.lib.gt_binary_op(self._ptr, _ensure_tensor(other, self)._ptr, code, 1.0))
 
@@ -1320,6 +2001,10 @@ class Tensor:
     def __xor__(self, other):
         code = _C.BIN_LOGICAL_XOR if self.dtype == _dt.bool else _C.BIN_BITWISE_XOR
         return self._cmp_op(other, code)
+
+    __rand__ = __and__
+    __ror__ = __or__
+    __rxor__ = __xor__
 
     def eq(self, other):
         return self == other
@@ -1373,6 +2058,7 @@ class Tensor:
 
     def fill_(self, value) -> Tensor:
         self._check_inplace()
+        value = _unwrap_numpy_scalar(value)
         if isinstance(value, (int, bool)) and not self.dtype.is_floating_point:
             _C.check_rc(_C.lib.gt_fill_scalar_i64(self._ptr, int(value)), "fill_")
         else:
@@ -1410,7 +2096,7 @@ class Tensor:
 
     def add_(self, other, *, alpha: float = 1.0) -> Tensor:
         self._check_inplace()
-        if isinstance(other, (int, float)):
+        if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_ADD, float(alpha)), "add_")
         else:
             _C.check_rc(_C.lib.gt_binary_inplace(self._ptr, _ensure_tensor(other, self)._ptr, _C.BIN_ADD, float(alpha)), "add_")
@@ -1418,7 +2104,7 @@ class Tensor:
 
     def sub_(self, other, *, alpha: float = 1.0) -> Tensor:
         self._check_inplace()
-        if isinstance(other, (int, float)):
+        if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_SUB, float(alpha)), "sub_")
         else:
             _C.check_rc(_C.lib.gt_binary_inplace(self._ptr, _ensure_tensor(other, self)._ptr, _C.BIN_SUB, float(alpha)), "sub_")
@@ -1426,7 +2112,7 @@ class Tensor:
 
     def mul_(self, other) -> Tensor:
         self._check_inplace()
-        if isinstance(other, (int, float)):
+        if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_MUL, 1.0), "mul_")
         else:
             _C.check_rc(_C.lib.gt_binary_inplace(self._ptr, _ensure_tensor(other, self)._ptr, _C.BIN_MUL, 1.0), "mul_")
@@ -1434,7 +2120,7 @@ class Tensor:
 
     def div_(self, other) -> Tensor:
         self._check_inplace()
-        if isinstance(other, (int, float)):
+        if _is_scalar(other):
             _C.check_rc(_C.lib.gt_binary_scalar_inplace(self._ptr, float(other), _C.BIN_DIV, 1.0), "div_")
         else:
             _C.check_rc(_C.lib.gt_binary_inplace(self._ptr, _ensure_tensor(other, self)._ptr, _C.BIN_DIV, 1.0), "div_")
@@ -1511,7 +2197,9 @@ class Tensor:
         return WhereFn.apply(mask, _from_python(float(value), dtype=self.dtype, device=self.device), self)
 
     def masked_select(self, mask: Tensor) -> Tensor:
-        return _wrap(_C.lib.gt_masked_select(self._ptr, mask._ptr), "masked_select")
+        if not isinstance(mask, Tensor) or mask.dtype != _dt.bool:
+            raise RuntimeError("masked_select: expected a boolean tensor for mask")
+        return MaskedSelectFn.apply(self, mask)
 
     def scatter_(self, dim: int, index: Tensor, src) -> Tensor:
         self._check_inplace()
@@ -1727,25 +2415,28 @@ class Tensor:
     def _norm_dims(self, dim):
         if dim is None:
             return ()
-        if isinstance(dim, int):
-            return (dim,)
-        return tuple(dim)
+        return _dims_tuple(dim)
 
+    @_numpy_style_reduction
     def sum(self, dim=None, keepdim: bool = False, *, dtype=None):
-        x = self if dtype is None else self.to(dtype)
+        (x,) = _autocast_float32(self) if dtype is None else (self.to(dtype),)
         return ReduceFn.apply(x, _C.RED_SUM, self._norm_dims(dim), keepdim)
 
+    @_numpy_style_reduction
     def mean(self, dim=None, keepdim: bool = False, *, dtype=None):
         x = self if dtype is None else self.to(dtype)
         return ReduceFn.apply(x, _C.RED_MEAN, self._norm_dims(dim), keepdim)
 
+    @_numpy_style_reduction
     def prod(self, dim=None, keepdim: bool = False, *, dtype=None):
-        x = self if dtype is None else self.to(dtype)
+        (x,) = _autocast_float32(self) if dtype is None else (self.to(dtype),)
         return ReduceFn.apply(x, _C.RED_PROD, self._norm_dims(dim), keepdim)
 
     def logsumexp(self, dim, keepdim: bool = False):
-        return ReduceFn.apply(self, _C.RED_LOGSUMEXP, self._norm_dims(dim), keepdim)
+        (x,) = _autocast_float32(self)
+        return ReduceFn.apply(x, _C.RED_LOGSUMEXP, self._norm_dims(dim), keepdim)
 
+    @_numpy_style_reduction
     def max(self, dim: int | None = None, keepdim: bool = False):
         if dim is None:
             return ReduceFn.apply(self, _C.RED_MAX, (), False)
@@ -1754,6 +2445,7 @@ class Tensor:
         idxs = _wrap(_C.lib.gt_reduce(self._ptr, _C.RED_ARGMAX, 1, _c_i32_arr((d,)), 1 if keepdim else 0, -1))
         return vals, idxs
 
+    @_numpy_style_reduction
     def min(self, dim: int | None = None, keepdim: bool = False):
         if dim is None:
             return ReduceFn.apply(self, _C.RED_MIN, (), False)
@@ -1762,38 +2454,87 @@ class Tensor:
         idxs = _wrap(_C.lib.gt_reduce(self._ptr, _C.RED_ARGMIN, 1, _c_i32_arr((d,)), 1 if keepdim else 0, -1))
         return vals, idxs
 
+    @_numpy_style_reduction
     def argmax(self, dim: int | None = None, keepdim: bool = False):
         dims = () if dim is None else (dim if dim >= 0 else dim + self.ndim,)
         arr = _c_i32_arr(dims) if dims else None
         return _wrap(_C.lib.gt_reduce(self._ptr, _C.RED_ARGMAX, len(dims), arr, 1 if keepdim else 0, -1))
 
+    @_numpy_style_reduction
     def argmin(self, dim: int | None = None, keepdim: bool = False):
         dims = () if dim is None else (dim if dim >= 0 else dim + self.ndim,)
         arr = _c_i32_arr(dims) if dims else None
         return _wrap(_C.lib.gt_reduce(self._ptr, _C.RED_ARGMIN, len(dims), arr, 1 if keepdim else 0, -1))
 
+    @_numpy_style_reduction
     def all(self, dim=None, keepdim: bool = False):
         dims = self._norm_dims(dim)
         arr = _c_i32_arr(dims) if dims else None
         return _wrap(_C.lib.gt_reduce(self._ptr, _C.RED_ALL, len(dims), arr, 1 if keepdim else 0, -1))
 
+    @_numpy_style_reduction
     def any(self, dim=None, keepdim: bool = False):
         dims = self._norm_dims(dim)
         arr = _c_i32_arr(dims) if dims else None
         return _wrap(_C.lib.gt_reduce(self._ptr, _C.RED_ANY, len(dims), arr, 1 if keepdim else 0, -1))
 
-    def var(self, dim=None, unbiased: bool = True, keepdim: bool = False, *, correction: int | None = None):
-        unb = (correction != 0) if correction is not None else unbiased
-        op = _C.RED_VAR_SAMPLE if unb else _C.RED_VAR_POP
-        return ReduceFn.apply(self, op, self._norm_dims(dim), keepdim)
+    @_numpy_style_reduction
+    def var(self, dim=None, unbiased: bool = True, keepdim: bool = False, *, correction=None, ddof=None, dtype=None):
+        """Variance: sum((x - mean)**2) / max(0, N - correction) over `dim` (all elements when
+        None). `correction` is any number - 1, the default, is the sample variance, 0 the
+        population variance - and `unbiased=False` is the old spelling of `correction=0`."""
+        return self._variance(dim, unbiased, keepdim, correction, ddof, dtype, False)
 
-    def std(self, dim=None, unbiased: bool = True, keepdim: bool = False, *, correction: int | None = None):
-        unb = (correction != 0) if correction is not None else unbiased
-        op = _C.RED_STD_SAMPLE if unb else _C.RED_STD_POP
-        return ReduceFn.apply(self, op, self._norm_dims(dim), keepdim)
+    @_numpy_style_reduction
+    def std(self, dim=None, unbiased: bool = True, keepdim: bool = False, *, correction=None, ddof=None, dtype=None):
+        """Standard deviation: the square root of var() with the same arguments."""
+        return self._variance(dim, unbiased, keepdim, correction, ddof, dtype, True)
+
+    def _variance(self, dim, unbiased, keepdim, correction, ddof, dtype, take_sqrt: bool):
+        name = "std" if take_sqrt else "var"
+        if type(dim) is bool:
+            # var(unbiased) / std(unbiased): a bool in first place is not a dimension
+            dim, unbiased = None, dim
+        if ddof is not None:                       # NumPy's name; np.var(t) and np.std(t) pass it
+            if correction is not None:
+                raise TypeError(f"{name}() got both 'correction' and 'ddof'")
+            correction = ddof
+        if correction is None:
+            correction = 1 if unbiased else 0
+        else:
+            correction = _unwrap_numpy_scalar(correction)
+            if isinstance(correction, Tensor) and correction.numel() == 1:
+                correction = correction.item()
+            if not _is_real_number(correction):
+                raise TypeError(f"{name}(): argument 'correction' must be Number, not {type(correction).__name__}")
+        x = self if dtype is None else self.to(dtype)
+        dims = self._norm_dims(dim)
+        count = x.numel()
+        if dims:
+            count = 1
+            for d in set(d if d >= 0 else d + x.ndim for d in dims):
+                if not 0 <= d < x.ndim:
+                    raise IndexError(f"Dimension out of range (expected to be in range of [{-x.ndim}, {x.ndim - 1}], but got {d})")
+                count *= x.shape[d]
+        if correction == 1 and count > 0:
+            return ReduceFn.apply(x, _C.RED_STD_SAMPLE if take_sqrt else _C.RED_VAR_SAMPLE, dims, keepdim)
+        # the population statistic, rescaled from 1/N to 1/max(0, N - correction)
+        out = ReduceFn.apply(x, _C.RED_STD_POP if take_sqrt else _C.RED_VAR_POP, dims, keepdim)
+        if correction == 0 and count > 0:
+            return out
+        if count == 0:
+            return out * math.nan                  # no elements: 0 / 0
+        degrees = max(0.0, count - correction)
+        if degrees == 0.0:
+            factor = math.inf                      # sum / 0: inf, or nan where the sum is 0 too
+        elif take_sqrt:
+            factor = math.sqrt(count / degrees)
+        else:
+            factor = count / degrees
+        return out * factor
 
     def norm(self, p: float | str = 2.0, dim=None, keepdim: bool = False, dtype=None):
-        x = self if dtype is None else self.to(dtype)
+        (x,) = _autocast_float32(self) if dtype is None else (self.to(dtype),)
         dims = self._norm_dims(dim)
         if p == "fro":
             p = 2.0
@@ -1807,18 +2548,22 @@ class Tensor:
         # General Lp differentiable formula
         return (x.abs() ** pv).sum(dim=dims if dims else None, keepdim=keepdim) ** (1.0 / pv)
 
+    @_numpy_style_reduction
     def amax(self, dim=None, keepdim: bool = False):
         return ReduceFn.apply(self, _C.RED_MAX, self._norm_dims(dim), keepdim)
 
+    @_numpy_style_reduction
     def amin(self, dim=None, keepdim: bool = False):
         return ReduceFn.apply(self, _C.RED_MIN, self._norm_dims(dim), keepdim)
 
     def cumsum(self, dim: int) -> Tensor:
-        return CumsumFn.apply(self, dim)
+        (x,) = _autocast_float32(self)
+        return CumsumFn.apply(x, dim)
 
     def cumprod(self, dim: int) -> Tensor:
-        d = dim if dim >= 0 else dim + self.ndim
-        return _wrap(_C.lib.gt_cumprod(self._ptr, d))
+        (x,) = _autocast_float32(self)
+        d = dim if dim >= 0 else dim + x.ndim
+        return _wrap(_C.lib.gt_cumprod(x._ptr, d))
 
     def sort(self, dim: int = -1, descending: bool = False):
         return SortFn.apply(self, dim, descending)
@@ -1841,11 +2586,11 @@ class Tensor:
         return v, i
 
     def softmax(self, dim: int, dtype=None) -> Tensor:
-        x = self if dtype is None else self.to(dtype)
+        (x,) = _autocast_float32(self) if dtype is None else (self.to(dtype),)
         return SoftmaxFn.apply(x, dim, 0)
 
     def log_softmax(self, dim: int, dtype=None) -> Tensor:
-        x = self if dtype is None else self.to(dtype)
+        (x,) = _autocast_float32(self) if dtype is None else (self.to(dtype),)
         return SoftmaxFn.apply(x, dim, 1)
 
     def index_select(self, dim: int, index: Tensor) -> Tensor:
@@ -1861,15 +2606,15 @@ class Tensor:
         return ScatterFn.apply(self, dim, index, src, 1)
 
     def flip(self, dims) -> Tensor:
-        if isinstance(dims, int):
+        if _is_int(dims):
             dims = (dims,)
         return FlipFn.apply(self, tuple(dims))
 
     def roll(self, shifts, dims=None) -> Tensor:
         if dims is None:
             return self.flatten().roll(shifts, dims=0).reshape(self.shape)
-        sh_tup = (shifts,) if isinstance(shifts, int) else tuple(shifts)
-        dm_tup = (dims,) if isinstance(dims, int) else tuple(dims)
+        sh_tup = _dims_tuple(shifts)
+        dm_tup = _dims_tuple(dims)
         return RollFn.apply(self, sh_tup, dm_tup)
 
     def rot90(self, k: int = 1, dims: tuple[int, int] = (0, 1)) -> Tensor:
@@ -1889,27 +2634,23 @@ class Tensor:
         return TrilTriuFn.apply(self, diagonal, 1)
 
     def diag(self, diagonal: int = 0) -> Tensor:
-        return _wrap(_C.lib.gt_diag(self._ptr, int(diagonal)))
+        k = int(diagonal)
+        if self.ndim == 1:
+            n = self.shape[0] + abs(k)
+            return DiagonalScatterFn.apply(self, (n, n), k)
+        if self.ndim == 2:
+            return DiagonalFn.apply(self, k).clone()
+        raise RuntimeError(f"diag expects a 1-D or 2-D tensor, got {self.ndim}-D")
 
     def diagonal(self, offset: int = 0, dim1: int = 0, dim2: int = 1) -> Tensor:
+        if self.ndim < 2:
+            raise RuntimeError("diagonal expects a tensor with at least 2 dimensions")
         x = self.movedim((dim1, dim2), (-2, -1))
-        if x.ndim == 2:
-            return x.diag(offset)
-        # Collect diagonals across batch
-        m, n = x.shape[-2], x.shape[-1]
-        if offset >= 0:
-            length = max(0, min(m, n - offset))
-            r0, c0 = 0, offset
-        else:
-            length = max(0, min(m + offset, n))
-            r0, c0 = -offset, 0
-        sh = x.shape[:-2] + (length,)
-        st = x.stride()[:-2] + (x.stride()[-2] + x.stride()[-1],)
-        off = x.storage_offset() + r0 * x.stride()[-2] + c0 * x.stride()[-1]
-        return SliceViewFn.apply(x, sh, st, off, ())
+        return DiagonalFn.apply(x, int(offset))
 
     def trace(self) -> Tensor:
-        return self.diagonal().sum()
+        diagonal = self.diagonal()
+        return ReduceFn.apply(diagonal, _C.RED_SUM, diagonal._norm_dims(None), False)   # not sum(): trace is not autocast
 
     def nonzero(self, *, as_tuple: bool = False):
         nz = _wrap(_C.lib.gt_nonzero(self._ptr), "nonzero")
@@ -1943,25 +2684,89 @@ class Tensor:
         return tuple(res)
 
     def matmul(self, other: Tensor) -> Tensor:
-        return MatMulFn.apply(self, other)
+        a, b = _autocast_lower(self, other)
+        return MatMulFn.apply(a, b)
+
+    # mm, bmm, mv and dot are matmul for operands of one particular rank each. matmul itself
+    # broadcasts and accepts any ranks, so the rank is checked here: torch.dot of two matrices
+    # is an error, not a matrix product.
 
     def mm(self, mat2: Tensor) -> Tensor:
+        if not isinstance(mat2, Tensor):
+            raise TypeError(f"mm(): argument 'mat2' must be Tensor, not {type(mat2).__name__}")
+        if self.ndim != 2 or mat2.ndim != 2:
+            raise RuntimeError(f"mm: expected 2D tensors, got {self.ndim}D and {mat2.ndim}D")
+        if self.shape[1] != mat2.shape[0]:
+            raise RuntimeError(
+                f"mat1 and mat2 shapes cannot be multiplied ({self.shape[0]}x{self.shape[1]} and {mat2.shape[0]}x{mat2.shape[1]})"
+            )
         return self.matmul(mat2)
 
     def bmm(self, mat2: Tensor) -> Tensor:
+        if not isinstance(mat2, Tensor):
+            raise TypeError(f"bmm(): argument 'mat2' must be Tensor, not {type(mat2).__name__}")
+        if self.ndim != 3 or mat2.ndim != 3:
+            raise RuntimeError(f"bmm: expected 3D tensors, got {self.ndim}D and {mat2.ndim}D")
+        if self.shape[0] != mat2.shape[0] or self.shape[2] != mat2.shape[1]:
+            raise RuntimeError(
+                f"Expected size for first two dimensions of batch2 tensor to be: [{self.shape[0]}, {self.shape[2]}] "
+                f"but got: [{mat2.shape[0]}, {mat2.shape[1]}]."
+            )
         return self.matmul(mat2)
 
     def mv(self, vec: Tensor) -> Tensor:
+        if not isinstance(vec, Tensor):
+            raise TypeError(f"mv(): argument 'vec' must be Tensor, not {type(vec).__name__}")
+        if self.ndim != 2 or vec.ndim != 1:
+            raise RuntimeError(f"mv: expected 2D matrix and 1D vector, got {self.ndim}D and {vec.ndim}D")
+        if self.shape[1] != vec.shape[0]:
+            raise RuntimeError(f"size mismatch, got input ({self.shape[0]}), mat ({self.shape[0]}x{self.shape[1]}), vec ({vec.shape[0]})")
         return self.matmul(vec)
 
     def dot(self, other: Tensor) -> Tensor:
-        return self.matmul(other)
+        if not isinstance(other, Tensor):
+            raise TypeError(f"dot(): argument 'tensor' must be Tensor, not {type(other).__name__}")
+        if self.ndim != 1 or other.ndim != 1:
+            raise RuntimeError(f"1D tensors expected, but got {self.ndim}D and {other.ndim}D tensors")
+        if self.shape[0] != other.shape[0]:
+            raise RuntimeError(
+                f"inconsistent tensor size, expected tensor [{self.shape[0]}] and src [{other.shape[0]}] to have the same "
+                f"number of elements, but got {self.shape[0]} and {other.shape[0]} elements respectively"
+            )
+        # the inner product through MatMulFn directly: it keeps the dtype of the vectors (a
+        # sum would widen integers to int64), and under autocast dot is not a matmul - it runs
+        # in the widest type of its operands, which is what MatMulFn's own promotion gives
+        return MatMulFn.apply(self, other)
 
     def addmm(self, mat1: Tensor, mat2: Tensor, *, beta: float = 1.0, alpha: float = 1.0) -> Tensor:
-        return AddmmFn.apply(self, mat1, mat2, float(beta), float(alpha))
+        """beta * self + alpha * (mat1 @ mat2), for matrices; self broadcasts to the product."""
+        if mat1.ndim != 2 or mat2.ndim != 2:
+            raise RuntimeError(f"addmm: expected 2D matrices mat1 and mat2, got {mat1.ndim}D and {mat2.ndim}D")
+        if mat1.shape[1] != mat2.shape[0]:
+            raise RuntimeError(
+                f"mat1 and mat2 shapes cannot be multiplied ({mat1.shape[0]}x{mat1.shape[1]} and {mat2.shape[0]}x{mat2.shape[1]})"
+            )
+        _check_expands_to(self, (mat1.shape[0], mat2.shape[1]), "addmm")
+        x, mat1, mat2 = _autocast_lower(self, mat1, mat2)
+        return AddmmFn.apply(x, mat1, mat2, float(beta), float(alpha))
 
     def baddbmm(self, batch1: Tensor, batch2: Tensor, *, beta: float = 1.0, alpha: float = 1.0) -> Tensor:
-        return _wrap(_C.lib.gt_baddbmm(self._ptr, batch1._ptr, batch2._ptr, float(beta), float(alpha)))
+        """beta * self + alpha * (batch1 @ batch2), for batches of matrices."""
+        if batch1.ndim != 3 or batch2.ndim != 3:
+            raise RuntimeError(f"baddbmm: expected 3D tensors batch1 and batch2, got {batch1.ndim}D and {batch2.ndim}D")
+        if batch1.shape[0] != batch2.shape[0] or batch1.shape[2] != batch2.shape[1]:
+            raise RuntimeError(
+                f"Expected size for first two dimensions of batch2 tensor to be: [{batch1.shape[0]}, {batch1.shape[2]}] "
+                f"but got: [{batch2.shape[0]}, {batch2.shape[1]}]."
+            )
+        _check_expands_to(self, (batch1.shape[0], batch1.shape[1], batch2.shape[2]), "baddbmm")
+        x, batch1, batch2 = _autocast_lower(self, batch1, batch2)
+        out = MatMulFn.apply(batch1, batch2)
+        if alpha != 1:
+            out = out * alpha
+        if beta == 0:
+            return out          # self is ignored: its nan and inf do not reach the result
+        return out + (x if beta == 1 else x * beta)
 
     def outer(self, vec2: Tensor) -> Tensor:
         return OuterFn.apply(self, vec2)
@@ -2014,3 +2819,85 @@ class Tensor:
 
     def new_tensor(self, data, *, dtype=None, device=None, requires_grad: bool = False):
         return _from_python(data, dtype=dtype or self.dtype, device=device or self.device, requires_grad=requires_grad)
+
+
+# ---------- autocast: the elementwise functions that run in float32 ----------
+
+for _name in ("acos", "asin", "cosh", "erfinv", "exp", "expm1", "log", "log10", "log2", "log1p", "reciprocal", "rsqrt", "sinh", "tan"):
+    setattr(Tensor, _name, _autocast_float32_method(getattr(Tensor, _name)))
+del _name
+
+
+# ---------- NumPy ufuncs computed by tensor operations (Tensor.__array_ufunc__) ----------
+
+
+def _ufunc_operand(x, ref: Tensor):
+    """An operand of a ufunc call in the form tensor operators take it: tensors and scalars as
+    they are, arrays and nested lists as tensors on the device of `ref`."""
+    if isinstance(x, Tensor):
+        return x
+    np = _numpy()
+    if np is not None and isinstance(x, np.ndarray):
+        return _tensor_from_ndarray(x, ref.device)
+    x = _unwrap_numpy_scalar(x)
+    if isinstance(x, (bool, int, float, complex)):
+        return x
+    if isinstance(x, (list, tuple)):
+        return _from_python(x, device=ref.device)
+    return NotImplemented
+
+
+def _ufunc_table() -> dict:
+    def method(name: str):
+        fn = getattr(Tensor, name)
+
+        def call(*operands):
+            # the named operations want tensors on both sides; a scalar joins the other operand
+            ref = next(x for x in operands if isinstance(x, Tensor))
+            return fn(*(_ensure_tensor(x, ref) for x in operands))
+
+        return call
+
+    table = {
+        "add": operator.add,
+        "subtract": operator.sub,
+        "multiply": operator.mul,
+        "divide": operator.truediv,
+        "true_divide": operator.truediv,
+        "floor_divide": operator.floordiv,
+        "remainder": operator.mod,
+        "power": operator.pow,
+        "matmul": operator.matmul,
+        "negative": operator.neg,
+        "positive": operator.pos,
+        "absolute": operator.abs,
+        "invert": operator.invert,
+        "equal": operator.eq,
+        "not_equal": operator.ne,
+        "less": operator.lt,
+        "less_equal": operator.le,
+        "greater": operator.gt,
+        "greater_equal": operator.ge,
+        "bitwise_and": operator.and_,
+        "bitwise_or": operator.or_,
+        "bitwise_xor": operator.xor,
+    }
+    # NumPy name -> Tensor method
+    named = {
+        "sin": "sin", "cos": "cos", "tan": "tan",
+        "arcsin": "asin", "arccos": "acos", "arctan": "atan", "arctan2": "atan2",
+        "sinh": "sinh", "cosh": "cosh", "tanh": "tanh",
+        "arcsinh": "asinh", "arccosh": "acosh", "arctanh": "atanh",
+        "exp": "exp", "expm1": "expm1", "exp2": "exp2",
+        "log": "log", "log2": "log2", "log10": "log10", "log1p": "log1p",
+        "sqrt": "sqrt", "square": "square", "sign": "sign", "fabs": "abs",
+        "floor": "floor", "ceil": "ceil", "trunc": "trunc", "rint": "round",
+        "isnan": "isnan", "isinf": "isinf", "isfinite": "isfinite", "logical_not": "logical_not",
+        "maximum": "maximum", "minimum": "minimum",
+    }  # fmt: skip
+    for np_name, tensor_name in named.items():
+        table[np_name] = method(tensor_name)
+    return table
+
+
+_UFUNC_TENSOR_OPS = _ufunc_table()

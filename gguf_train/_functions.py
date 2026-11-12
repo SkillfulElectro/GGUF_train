@@ -37,6 +37,9 @@ def _compute_view_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 def _can_view_reshape(old_shape: tuple[int, ...], old_strides: tuple[int, ...], new_shape: tuple[int, ...]) -> tuple[int, ...] | None:
     if not old_shape:
         return _compute_view_strides(new_shape)
+    if 0 in old_shape:
+        # no elements: every shape without elements is a view of it, whatever the strides
+        return tuple(old_strides) if tuple(old_shape) == tuple(new_shape) else _compute_view_strides(new_shape)
     # Collapse contiguous chunks (ignoring size-1 dims)
     chunks: list[tuple[int, int]] = []  # (size, stride)
     for s, st in zip(old_shape, old_strides):
@@ -417,8 +420,15 @@ class UnarySimpleFn(Function):
                 deriv = _wrap(_C.lib.gt_unary_op(x._ptr, _C.UNARY_GELU_DERIV, 0.0, 0.0), "gelu_deriv")
                 gx = grad_out * deriv
         elif op == _C.UNARY_GELU_TANH:
-            deriv = _wrap(_C.lib.gt_unary_op(x._ptr, _C.UNARY_GELU_TANH_DERIV, 0.0, 0.0), "gelu_tanh_deriv")
-            gx = grad_out * deriv
+            if _autograd_state.is_grad_enabled():
+                # built from differentiable ops, so that create_graph=True can differentiate
+                # the derivative again (the native kernel returns a constant)
+                k = math.sqrt(2.0 / math.pi)
+                th = (k * (x + 0.044715 * x * x * x)).tanh()
+                gx = grad_out * (0.5 * (1.0 + th) + (0.5 * k) * x * (1.0 - th * th) * (1.0 + 3.0 * 0.044715 * x * x))
+            else:
+                deriv = _wrap(_C.lib.gt_unary_op(x._ptr, _C.UNARY_GELU_TANH_DERIV, 0.0, 0.0), "gelu_tanh_deriv")
+                gx = grad_out * deriv
         elif op == _C.UNARY_GELU_QUICK:
             s = (1.702 * x).sigmoid()
             gx = grad_out * (s + 1.702 * x * s * (1.0 - s))
@@ -446,7 +456,10 @@ class UnarySimpleFn(Function):
             gx = grad_out * (mask + (1.0 - mask) * s)
         elif op == _C.UNARY_MISH:
             if _autograd_state.is_grad_enabled():
-                sp = (x.exp() + 1.0).log()
+                # softplus through the op that switches to the identity for large inputs:
+                # log(exp(x) + 1) overflows float32 from x = 89 on, and differentiating the
+                # resulting inf once more gives nan
+                sp = UnarySimpleFn.apply(x, _C.UNARY_SOFTPLUS, 1.0, 20.0)
                 th = sp.tanh()
                 sig = x.sigmoid()
                 gx = grad_out * (th + x * sig * (1.0 - th * th))
@@ -1055,6 +1068,174 @@ class GatherFn(Function):
         from ._creation import zeros
         g_in = zeros(ctx.orig_shape, dtype=grad_out.dtype, device=grad_out.device)
         return (g_in.scatter_add(ctx.dim, index, grad_out), None, None)
+
+
+def _index_ptrs(indices):
+    return (ctypes.c_void_p * len(indices))(*[t._ptr for t in indices])
+
+
+def _broadcast_shape(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...]:
+    out = []
+    for i in range(1, max(len(a), len(b)) + 1):
+        da = a[-i] if i <= len(a) else 1
+        db = b[-i] if i <= len(b) else 1
+        if da != db and da != 1 and db != 1:
+            raise RuntimeError(f"shapes {list(a)} and {list(b)} cannot be broadcast together")
+        out.append(db if da == 1 else da)
+    return tuple(reversed(out))
+
+
+class IndexTensorFn(Function):
+    """x[..., i0, i1, ...]: integer index tensors on the dimensions `dims` (ascending).
+
+    The gradient is zeros(x.shape) with the incoming gradient added at the indexed elements;
+    an element that was read several times receives the sum.
+    """
+
+    @staticmethod
+    def forward(ctx: Context, x, dims: tuple[int, ...], *indices):
+        ctx.x_shape = x.shape
+        ctx.dims = tuple(int(d) for d in dims)
+        ctx.n_idx = len(indices)
+        ctx.save_for_backward(*indices)
+        return _wrap(_C.lib.gt_index_tensor(x._ptr, len(indices), _index_ptrs(indices), _c_i32_arr(ctx.dims)), "index")
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        rest = (None,) * (1 + ctx.n_idx)
+        if grad_out is None:
+            return (None,) + rest
+        return (IndexAccumulateFn.apply(grad_out, ctx.x_shape, ctx.dims, *ctx.saved_tensors),) + rest
+
+
+class IndexAccumulateFn(Function):
+    """zeros(shape) with `src` added at [..., i0, i1, ...] - the adjoint of IndexTensorFn."""
+
+    @staticmethod
+    def forward(ctx: Context, src, shape: tuple[int, ...], dims: tuple[int, ...], *indices):
+        from ._creation import zeros
+
+        ctx.dims = tuple(int(d) for d in dims)
+        ctx.n_idx = len(indices)
+        ctx.save_for_backward(*indices)
+        out = zeros(tuple(shape), dtype=src.dtype, device=src.device)
+        _C.check_rc(
+            _C.lib.gt_index_put(out._ptr, len(indices), _index_ptrs(indices), _c_i32_arr(ctx.dims), src._ptr, 1),
+            "index_put",
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        rest = (None,) * (2 + ctx.n_idx)
+        if grad_out is None:
+            return (None,) + rest
+        return (IndexTensorFn.apply(grad_out, ctx.dims, *ctx.saved_tensors),) + rest
+
+
+class MaskedSelectFn(Function):
+    """The elements of x where mask is True (x and mask broadcast against each other), 1-D."""
+
+    @staticmethod
+    def forward(ctx: Context, x, mask):
+        ctx.x_shape = x.shape
+        ctx.save_for_backward(mask)
+        return _wrap(_C.lib.gt_masked_select(x._ptr, mask._ptr), "masked_select")
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        if grad_out is None:
+            return (None, None)
+        (mask,) = ctx.saved_tensors
+        full = MaskedScatterFn.apply(grad_out, mask, _broadcast_shape(ctx.x_shape, mask.shape))
+        return (_unbroadcast(full, ctx.x_shape), None)
+
+
+class MaskedScatterFn(Function):
+    """zeros(shape) holding the elements of `src`, in order, where mask is True - the adjoint
+    of MaskedSelectFn."""
+
+    @staticmethod
+    def forward(ctx: Context, src, mask, shape: tuple[int, ...]):
+        from ._creation import zeros
+
+        shape = tuple(shape)
+        ctx.save_for_backward(mask)
+        out = zeros(shape, dtype=src.dtype, device=src.device)
+        if src.numel() == 0:
+            return out
+        if len(shape) == 0:
+            _C.check_rc(_C.lib.gt_tensor_copy_inplace(out._ptr, src._ptr), "masked_scatter")
+            return out
+        full_mask = mask if mask.shape == shape else mask.expand(shape)
+        coords = full_mask.nonzero(as_tuple=True)
+        _C.check_rc(
+            _C.lib.gt_index_put(out._ptr, len(coords), _index_ptrs(coords), _c_i32_arr(range(len(coords))), src._ptr, 0),
+            "masked_scatter",
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        if grad_out is None:
+            return (None, None, None)
+        (mask,) = ctx.saved_tensors
+        return (MaskedSelectFn.apply(grad_out, mask), None, None)
+
+
+def _diagonal_view(shape, strides, storage_offset: int, offset: int):
+    """(shape, strides, storage offset) of the diagonal of the last two dimensions."""
+    rows, cols = shape[-2], shape[-1]
+    if offset >= 0:
+        length = max(0, min(rows, cols - offset))
+        r0, c0 = 0, offset
+    else:
+        length = max(0, min(rows + offset, cols))
+        r0, c0 = -offset, 0
+    return (
+        tuple(shape[:-2]) + (length,),
+        tuple(strides[:-2]) + (strides[-2] + strides[-1],),
+        storage_offset + r0 * strides[-2] + c0 * strides[-1],
+    )
+
+
+class DiagonalFn(Function):
+    """The diagonal of the last two dimensions, as a view."""
+
+    @staticmethod
+    def forward(ctx: Context, x, offset: int):
+        ctx.x_shape = x.shape
+        ctx.offset = int(offset)
+        sh, st, off = _diagonal_view(x.shape, x.stride(), x.storage_offset(), ctx.offset)
+        return _wrap(_C.lib.gt_tensor_view(x._ptr, len(sh), _c_i64_arr(sh), _c_i64_arr(st), off), "diagonal")
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        if grad_out is None:
+            return (None, None)
+        return (DiagonalScatterFn.apply(grad_out, ctx.x_shape, ctx.offset), None)
+
+
+class DiagonalScatterFn(Function):
+    """zeros(shape) with `src` on the diagonal of the last two dimensions - the adjoint of
+    DiagonalFn, and torch.diag() of a vector."""
+
+    @staticmethod
+    def forward(ctx: Context, src, shape: tuple[int, ...], offset: int):
+        from ._creation import zeros
+
+        ctx.offset = int(offset)
+        out = zeros(tuple(shape), dtype=src.dtype, device=src.device)
+        sh, st, off = _diagonal_view(out.shape, out.stride(), out.storage_offset(), ctx.offset)
+        view = _wrap(_C.lib.gt_tensor_view(out._ptr, len(sh), _c_i64_arr(sh), _c_i64_arr(st), off), "diagonal")
+        _C.check_rc(_C.lib.gt_tensor_copy_inplace(view._ptr, src._ptr), "diagonal scatter")
+        return out
+
+    @staticmethod
+    def backward(ctx: Context, grad_out):
+        if grad_out is None:
+            return (None, None, None)
+        return (DiagonalFn.apply(grad_out, ctx.offset), None, None)
 
 
 class ScatterFn(Function):
@@ -1695,7 +1876,7 @@ class CrossEntropyFn(Function):
                 ctx.label_smoothing,
                 ctx.reduction_code,
             ),
-            "cross_entropy_bw",
+            "cross_entropy",
         )
         return (gx, None, None, None, None, None)
 
@@ -1712,7 +1893,7 @@ class RoPEFn(Function):
         if grad_out is None:
             return (None,) * 7
         (pos,) = ctx.saved_tensors
-        gx = _wrap(_C.lib.gt_rope_backward(grad_out._ptr, pos._ptr, *ctx.args), "rope_bw")
+        gx = _wrap(_C.lib.gt_rope_backward(grad_out._ptr, pos._ptr, *ctx.args), "rope")
         return (gx, None, None, None, None, None, None)
 
 

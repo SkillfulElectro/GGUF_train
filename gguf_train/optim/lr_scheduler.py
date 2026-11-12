@@ -198,12 +198,45 @@ class ReduceLROnPlateau:
         return [g["lr"] for g in self.optimizer.param_groups]
 
 
-class SequentialLR:
-    def __init__(self, optimizer: Optimizer, schedulers: list, milestones: list[int]) -> None:
+class SequentialLR(LRScheduler):
+    """Runs schedulers one after another: schedulers[i + 1] takes over at epoch milestones[i].
+
+    Every scheduler starts at its own epoch 0 when its turn comes.
+    """
+
+    def __init__(self, optimizer: Optimizer, schedulers: list, milestones: list[int], last_epoch: int = -1) -> None:
+        schedulers = list(schedulers)
+        milestones = [int(m) for m in milestones]
+        if len(schedulers) < 1:
+            raise ValueError("SequentialLR expects at least one scheduler")
+        for i, sched in enumerate(schedulers):
+            if isinstance(sched, ReduceLROnPlateau):
+                raise ValueError(f"SequentialLR does not support ReduceLROnPlateau (scheduler at index {i}): it needs a metric to step")
+            if getattr(sched, "optimizer", None) is not optimizer:
+                raise ValueError(f"SequentialLR expects all schedulers to belong to the same optimizer, the one at index {i} does not")
+        if len(milestones) != len(schedulers) - 1:
+            raise ValueError(
+                "SequentialLR expects one milestone less than schedulers, "
+                f"got {len(schedulers)} schedulers and {len(milestones)} milestones"
+            )
+        if any(m2 <= m1 for m1, m2 in zip(milestones, milestones[1:])):
+            raise ValueError(f"SequentialLR expects increasing milestones, got {milestones}")
         self.optimizer = optimizer
         self.schedulers = schedulers
         self.milestones = milestones
-        self.last_epoch = 0
+        self.last_epoch = last_epoch + 1
+        self.base_lrs = list(schedulers[0].base_lrs)
+
+        # Every scheduler took its first step when it was created, and each of those steps set
+        # the optimizer's learning rate: the scheduler created last had the final word. Take the
+        # steps back and start again with the first scheduler alone.
+        for sched in schedulers:
+            sched.last_epoch -= 1
+        schedulers[0].step()
+        self._last_lr = schedulers[0].get_last_lr()
+
+    def get_lr(self) -> list[float]:
+        return list(self._last_lr)
 
     def step(self) -> None:
         self.last_epoch += 1
@@ -211,8 +244,30 @@ class SequentialLR:
         for m in self.milestones:
             if self.last_epoch >= m:
                 idx += 1
-        idx = min(idx, len(self.schedulers) - 1)
-        self.schedulers[idx].step()
+        sched = self.schedulers[idx]
+        if idx > 0 and self.milestones[idx - 1] == self.last_epoch:
+            sched.step(0)                      # its turn begins: its epoch 0
+        else:
+            sched.step()
+        self._last_lr = sched.get_last_lr()
 
     def get_last_lr(self) -> list[float]:
-        return [g["lr"] for g in self.optimizer.param_groups]
+        return list(self._last_lr)
+
+    def state_dict(self) -> dict:
+        return {
+            "last_epoch": self.last_epoch,
+            "milestones": list(self.milestones),
+            "_last_lr": list(self._last_lr),
+            "schedulers": [sched.state_dict() for sched in self.schedulers],
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        saved = state_dict.get("schedulers", [])
+        if len(saved) != len(self.schedulers):
+            raise ValueError(f"loaded state dict holds {len(saved)} schedulers, this SequentialLR has {len(self.schedulers)}")
+        self.last_epoch = int(state_dict.get("last_epoch", self.last_epoch))
+        self.milestones = [int(m) for m in state_dict.get("milestones", self.milestones)]
+        self._last_lr = list(state_dict.get("_last_lr", self._last_lr))
+        for sched, st in zip(self.schedulers, saved):
+            sched.load_state_dict(st)
