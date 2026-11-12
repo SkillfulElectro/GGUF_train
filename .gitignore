@@ -13,6 +13,7 @@ __pycache__/
 *.pth
 *.bin
 
-# llama.cpp upstream source is downloaded at build time (always latest master).
-# Pin via GGUF_TRAIN_LLAMA_COMMIT / GGUF_TRAIN_LLAMA_BRANCH if a fixed revision is needed.
+# llama.cpp upstream source is downloaded at build time, at the revision pinned in
+# build_native.py (LLAMA_PINNED_COMMIT). Override with GGUF_TRAIN_LLAMA_COMMIT /
+# GGUF_TRAIN_LLAMA_BRANCH to build against a different one.
 third_party/llama.cpp/
